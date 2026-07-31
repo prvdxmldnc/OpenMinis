@@ -21,6 +21,7 @@ object AgentTools {
         // AIChatViewModel.makeAgentTools(memoryEnabled:).
         memoryEnabled: Boolean = true,
     ): List<AgentToolDefinition> = buildList {
+        add(AndroidNativeTool.definition())
         add(shellExecuteDefinition())
         add(FileReadTool.definition())
         add(FileWriteTool.definition())

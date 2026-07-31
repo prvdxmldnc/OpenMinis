@@ -51,6 +51,7 @@ import com.openminis.app.sandbox.ExecutionCoordinator
 import com.openminis.app.terminal.MinisOpenUrlBroker
 import com.openminis.app.terminal.MinisUrlMarker
 import com.openminis.app.tools.AgentTools
+import com.openminis.app.tools.AndroidNativeTool
 import com.openminis.app.tools.FileEditTool
 import com.openminis.app.tools.FileReadTool
 import com.openminis.app.tools.FileWriteTool
@@ -7144,6 +7145,11 @@ class ChatViewModel(
             // bindMounts map and would surface another session's
             // /var/minis/{workspace,attachments,offloads,browser} files.
             ReadImageTool.NAME -> ReadImageTool.execute(argsJson, activeSessionId, context)
+            AndroidNativeTool.NAME -> AndroidNativeTool.execute(
+                argsJson = argsJson,
+                sessionId = activeSessionId,
+                userIntent = agentHistory.lastOrNull { it.role == LLMMessage.Role.USER }?.content,
+            )
             "shell_execute" -> executeShellCommand(argsJson, toolId, toolBlocks, assistantId, currentText)
             "browser_use" -> executeBrowserUseTool(argsJson)
             "memory_write" -> executeMemoryWriteTool(argsJson)
@@ -7243,11 +7249,21 @@ class ChatViewModel(
                 }
             }
 
+            // A simple android-* CLI does not need Alpine or PRoot. Dispatch it
+            // straight to the same host-side handler used by android_native.
+            // Shell pipelines/expansions deliberately remain on the real shell
+            // path so this shortcut never changes their semantics.
+            val dispatchSessionId = activeSessionId
+            AndroidNativeTool.executeSimpleShellCommandIfSupported(
+                commandLine = command,
+                sessionId = dispatchSessionId,
+                toolTitle = toolTitle,
+            )?.let { return it }
+
             // [diag] sessionId vs realSessionId mismatch was the root cause
             // of the Chinese-emoji filename "disappears" bug. `activeSessionId`
             // resolves to the persisted id once `ensureSession()` has run, so
             // every shell runs in a directory that survives VM recreation.
-            val dispatchSessionId = activeSessionId
             android.util.Log.w("ShellExecDiag",
                 "executeShell dispatch=$dispatchSessionId rawSessionId=$sessionId realSessionId=$realSessionId isDraft=$isDraft cmd=${command.take(120).replace('\n', ' ')}")
 
@@ -7989,6 +8005,7 @@ Memory system (currently DISABLED):
         val base = identitySection + """You should proactively use shell commands to accomplish the user's tasks — installing packages (apk add), writing and running scripts, managing files, networking, and any other operations a Linux terminal can perform.
 
 Available tools:
+- android_native: Directly invoke Android framework, radio, hardware, Accessibility, Shizuku, or existing-root capabilities. For anything involving the phone itself, prefer this structured tool over shell_execute. It does not require the Alpine/PRoot sandbox.
 - shell_execute: Run any shell command. Each invocation is an isolated process with stdout/stderr captured. Prefer this for most tasks — it is a real Linux environment with persistent filesystem. Common tools (python3, pip, curl, wget, git, ssh, etc.) can be installed via apk add; Python packages via pip install. Use `which <cmd>` to check if a tool is already installed before running apk add — many packages persist across sessions. When you need to wait before checking results (e.g. polling, waiting for a process), use the `delay` parameter instead of `sleep` in the command — delay blocks the agent flow without occupying the shell, so other concurrent tasks can use it during the wait. This avoids resource contention. Execution discipline for long-running or dispatched work: make tool calls immediately instead of describing intentions, and keep working until the task is complete. Without a scheduler or timed-callback tool, `delay` is your ONLY wait mechanism within a turn — to follow up on something still running, chain delay-then-check calls at a task-appropriate interval until you have the result or hit a sensible retry cap. NEVER end a turn with a promise of future action: 'I'll keep monitoring', 'will sync the result later', and ending right after a single still-running status check with 'let's keep waiting' are all the same violation — once your turn ends, NOTHING runs until the user's next message. If polling to completion is genuinely not worth blocking the turn, close honestly instead: state that the task keeps running in the background, that you will only learn its outcome when the user next messages (or they ask you to check), and — if something must fire on a schedule beyond this conversation — point them to the options under 'Scheduled tasks' later in this prompt (native alarm reminder or a system-level schedule; those notify the USER, they do not wake you).
 - file_read: Read file contents (faster than cat).
 - file_write: Create new files or overwrite existing files (faster than echo/tee).
@@ -8047,7 +8064,7 @@ Tone and style:
 - Be concise. Prefer action over explanation — when the user asks for something that can be done via shell, do it directly.
 
 Android-only tools (android-* CLIs):
-CLI tools at /usr/local/bin with the `android-` prefix give you access to Android framework capabilities and on-device control. Invoke them from shell_execute like any other binary — they are already on PATH. Each tool prints JSON (or a short human-readable line) and supports --help for full usage. Tools gated by Shizuku or AccessibilityService return permission_denied when not granted — handle that gracefully and point the user at [Settings → Permissions](minis://settings/permissions).
+The `android_native` structured tool gives direct access to Android framework capabilities and on-device control. Use it for every `android-*` command below; pass the CLI name as `command` and the remaining tokens as the `arguments` array. Do not use Linux desktop utilities such as nmcli, iw, bluetoothctl, rfkill, lspci, or lsusb for phone hardware. The same android-* names are also available as compatibility CLIs inside PRoot. Each command prints JSON (or a short human-readable line) and supports --help. Commands gated by Shizuku or AccessibilityService return permission_denied when not granted — handle that gracefully and point the user at [Settings → Permissions](minis://settings/permissions).
 - android-alarm — schedule alarms/timers in the system Clock app (`schedule <HH:MM> --label <L> [--repeat ONCE|DAILY|WEEKDAYS]`, `timer <seconds> --label <L>`, `open`). Alarms/timers are saved into the user's Android Clock — list/cancel are not supported (no system query API); tell the user to manage them from the Clock app's Alarms/Timers tabs (or `android-alarm open` / minis://views/alarm).
 - android-calendar — read/write the device calendar (`list --start YYYY-MM-DD [--end ...] [--max N]`; `create --title <T> --start <ISO> [--end <ISO>] [--description <D>] [--location <L>] [--all-day]`).
 - android-clipboard — `get | set <text> [--label L] | clear`.

@@ -24,6 +24,13 @@ are operating-system/user consent boundaries and still apply.
 
 ## New commands
 
+The agent receives these capabilities through the structured
+`android_native` tool. It dispatches directly to Android-host handlers and does
+not require PRoot. The command names below remain available inside the terminal
+for manual use and backwards compatibility. Requests involving phone hardware
+must use `android_native`, not Linux desktop utilities such as `nmcli`, `iw`,
+`bluetoothctl`, or `lsusb`.
+
 ### Wi-Fi
 
 ```sh
@@ -121,6 +128,11 @@ android-bluetooth status
 android-shizuku-cli service status
 android-root-cli status
 ```
+
+The build now fails before compilation if the Alpine rootfs, the PRoot asset,
+or `lib/arm64-v8a/libproot.so` is missing. Always run the documented native
+dependency steps before producing an APK; an incomplete shell-less APK is no
+longer permitted.
 
 ## Scope
 

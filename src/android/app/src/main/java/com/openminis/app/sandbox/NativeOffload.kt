@@ -75,6 +75,32 @@ object NativeOffloadServer {
         Log.d(TAG, "register '$name' (total=${handlers.size})")
     }
 
+    /**
+     * Invoke a registered Android handler directly from a structured agent
+     * tool. This deliberately bypasses PRoot: phone radios, framework APIs,
+     * Shizuku and an existing root backend are Android-host capabilities and
+     * must remain available even while the Linux rootfs is being repaired.
+     */
+    fun invokeRegistered(
+        name: String,
+        request: NativeOffloadRequest,
+    ): NativeOffloadResult {
+        val handler = handlers[name]
+            ?: return NativeOffloadResult(
+                exitCode = 127,
+                output = "native_offload: no handler for '$name'\n",
+            )
+        return try {
+            handler.handle(request)
+        } catch (e: Exception) {
+            Log.w(TAG, "direct handler '$name' threw: ${e.message}", e)
+            NativeOffloadResult(
+                exitCode = 1,
+                output = "native_offload: ${e.message}\n",
+            )
+        }
+    }
+
     @Synchronized
     fun start(rootfsDir: File) {
         rootfsTmpDir = File(rootfsDir, "tmp")
@@ -180,23 +206,20 @@ object NativeOffloadServer {
         Log.d(TAG, "recv pid=$pid name='$name' argc=$argc argv=$argv cwd=$cwd envc=$envc")
 
         val t0 = System.nanoTime()
-        val handler = handlers[name]
-        val result = if (handler == null) {
+        val result = if (!handlers.containsKey(name)) {
             Log.w(TAG, "no handler registered for '$name' (known=${handlers.keys})")
             NativeOffloadResult(exitCode = 127, output = "native_offload: no handler for '$name'\n")
         } else {
-            try {
-                handler.handle(NativeOffloadRequest(
+            invokeRegistered(
+                name,
+                NativeOffloadRequest(
                     pid = pid,
                     argv = argv,
                     env = env,
                     cwd = cwd,
                     sessionId = env["MINIS_CHAT_SESSION_ID"]?.takeIf { it.isNotEmpty() },
-                ))
-            } catch (e: Exception) {
-                Log.w(TAG, "handler '$name' threw: ${e.message}", e)
-                NativeOffloadResult(exitCode = 1, output = "native_offload: ${e.message}\n")
-            }
+                ),
+            )
         }
         val elapsedMs = (System.nanoTime() - t0) / 1_000_000
 
