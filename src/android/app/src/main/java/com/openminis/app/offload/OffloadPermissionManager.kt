@@ -81,13 +81,15 @@ object OffloadPermissionManager {
         ToolPermissionInfo("weather", "Weather", PermissionCategory.SYSTEM, PermissionLevel.BYPASS, showInSettings = false),
         ToolPermissionInfo("notification", "Notifications", PermissionCategory.SYSTEM, PermissionLevel.BYPASS, showInSettings = false),
         ToolPermissionInfo("device_info", "Device Info", PermissionCategory.SYSTEM, PermissionLevel.BYPASS, showInSettings = false),
-        // T330: integrations — opt-in by default. These tools can drive
-        // other apps and read on-screen content, so the safer posture is
-        // NOT_ALLOWED until the user picks otherwise even when the
-        // underlying system layer (Shizuku binder / Accessibility service)
-        // is already authorized.
-        ToolPermissionInfo("a11y_cli", "android-a11y-cli", PermissionCategory.INTEGRATIONS, PermissionLevel.NOT_ALLOWED),
-        ToolPermissionInfo("shizuku_cli", "android-shizuku-cli", PermissionCategory.INTEGRATIONS, PermissionLevel.NOT_ALLOWED),
+        // Research fork: integrations are enabled in the agent gate by
+        // default. Android runtime permissions plus Accessibility, pairing,
+        // Shizuku and root-manager consent remain separate OS-level gates.
+        ToolPermissionInfo("a11y_cli", "android-a11y-cli", PermissionCategory.INTEGRATIONS, PermissionLevel.BYPASS),
+        ToolPermissionInfo("shizuku_cli", "android-shizuku-cli", PermissionCategory.INTEGRATIONS, PermissionLevel.BYPASS),
+        ToolPermissionInfo("wifi_cli", "android-wifi", PermissionCategory.INTEGRATIONS, PermissionLevel.BYPASS),
+        ToolPermissionInfo("bluetooth_cli", "android-bluetooth", PermissionCategory.INTEGRATIONS, PermissionLevel.BYPASS),
+        ToolPermissionInfo("hardware_cli", "android-hardware", PermissionCategory.INTEGRATIONS, PermissionLevel.BYPASS),
+        ToolPermissionInfo("root_cli", "android-root-cli", PermissionCategory.INTEGRATIONS, PermissionLevel.BYPASS),
     )
 
     /** Stable session-id used by NativeOffloadHandlers when calling

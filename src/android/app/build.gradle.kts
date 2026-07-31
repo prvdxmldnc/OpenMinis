@@ -141,8 +141,11 @@ tasks.named("preBuild") { dependsOn(copyBashismRules) }
 val stageDebugSkillAssets by tasks.registering(Exec::class) {
     val script = rootProject.file("../../scripts/gen_debug_skill_android.sh")
     val skillDir = rootProject.file("../../.claude/skills/debug-server")
-    onlyIf { script.exists() }
-    inputs.dir(skillDir).optional()
+    // The public mirror does not always include the internal .claude skill
+    // source. Skip staging when either input is absent instead of failing
+    // Gradle validation before `onlyIf` can make the debug asset optional.
+    onlyIf { script.exists() && skillDir.isDirectory }
+    if (skillDir.isDirectory) inputs.dir(skillDir)
     inputs.file(script).optional()
     outputs.dir(layout.projectDirectory.dir("src/debug/assets/debug-skill"))
     commandLine("bash", script.absolutePath)

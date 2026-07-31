@@ -118,6 +118,10 @@ always carries the latest APK.
 
 ## Building from source
 
+For the experimental Android fork with native Wi-Fi/Bluetooth/hardware access,
+Shizuku/AXManager integration, and an unrestricted existing-root shell, see the
+[Android research toolkit](docs/ANDROID_RESEARCH_TOOLKIT.md).
+
 Minis ships a Linux sandbox inside the app, so the native dependencies (iSH on
 iOS, PRoot on Android, FFmpeg, LAME) and the Alpine rootfs are **built from
 source** rather than committed as binaries.

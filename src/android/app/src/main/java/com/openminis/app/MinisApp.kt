@@ -38,14 +38,17 @@ import com.openminis.app.sandbox.RootfsManager
 import com.openminis.app.sandbox.offload.AccessibilityOffloadHandler
 import com.openminis.app.sandbox.offload.AlarmOffloadHandler
 import com.openminis.app.sandbox.offload.BrowserUseOffloadHandler
+import com.openminis.app.sandbox.offload.BluetoothOffloadHandler
 import com.openminis.app.sandbox.offload.CalendarOffloadHandler
 import com.openminis.app.sandbox.offload.ClipboardOffloadHandler
 import com.openminis.app.sandbox.offload.ContactsOffloadHandler
 import com.openminis.app.sandbox.offload.DeviceOffloadHandler
+import com.openminis.app.sandbox.offload.HardwareOffloadHandler
 import com.openminis.app.sandbox.offload.LocationOffloadHandler
 import com.openminis.app.sandbox.offload.ModelUseOffloadHandler
 import com.openminis.app.sandbox.offload.SessionsOffloadHandler
 import com.openminis.app.sandbox.offload.ShizukuOffloadHandler
+import com.openminis.app.sandbox.offload.RootOffloadHandler
 import com.openminis.app.sandbox.offload.NotificationOffloadHandler
 import com.openminis.app.sandbox.offload.OpenOffloadHandler
 import com.openminis.app.sandbox.offload.PhotosOffloadHandler
@@ -53,6 +56,7 @@ import com.openminis.app.sandbox.offload.PlayerOffloadHandler
 import com.openminis.app.sandbox.offload.SpeakOffloadHandler
 import com.openminis.app.sandbox.offload.SpeechOffloadHandler
 import com.openminis.app.sandbox.offload.WeatherOffloadHandler
+import com.openminis.app.sandbox.offload.WifiOffloadHandler
 import com.openminis.app.service.SessionActivityTracker
 import com.openminis.app.ui.MinisImageFetcher
 import kotlinx.coroutines.launch
@@ -381,6 +385,14 @@ class MinisApp : Application(), ImageLoaderFactory {
         NativeOffloadServer.register("android-speak", SpeakOffloadHandler(this))
         NativeOffloadServer.register("android-speech", SpeechOffloadHandler(this))
         NativeOffloadServer.register("android-weather", WeatherOffloadHandler(this))
+        // Research toolkit: direct Android connectivity/hardware surfaces.
+        // These are host-side framework APIs, not Linux utilities inside PRoot,
+        // so the agent gets real phone radios and devices rather than a fake
+        // container view (e.g. there is intentionally no dependency on nmcli).
+        NativeOffloadServer.register("android-wifi", WifiOffloadHandler(this))
+        NativeOffloadServer.register("android-bluetooth", BluetoothOffloadHandler(this))
+        NativeOffloadServer.register("android-hardware", HardwareOffloadHandler(this))
+        NativeOffloadServer.register("android-root-cli", RootOffloadHandler())
         // T323: UI-layer automation backed by MinisAccessibilityService.
         NativeOffloadServer.register("android-a11y-cli", AccessibilityOffloadHandler(this))
         NativeOffloadServer.register("minis-model-use", ModelUseOffloadHandler(this, providerRepository))
