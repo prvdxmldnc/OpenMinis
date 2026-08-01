@@ -5889,6 +5889,8 @@ class ChatViewModel(
         // we surface a real error instead of a silent blank bubble. Mirrors iOS
         // AIChatViewModel.didInjectEmptyToolReminderThisRun.
         var didInjectEmptyToolReminder = false
+        var shellInfrastructureFailures = 0
+        var stopAfterInfrastructureFailure: String? = null
         for (turn in 0 until MAX_AGENT_TURNS) {
             // Sanitize history before each API call (mirrors iOS pre-API validation)
             sanitizeAgentHistory()
@@ -6847,6 +6849,18 @@ class ChatViewModel(
                 val result = executeTool(name, argsStr, id, allToolBlocks, assistantId, accumulatedText)
                 android.util.Log.d("ToolChain[VM]", "[turn=$turn] executeTool END name=$name success=${result.success} title=${result.toolTitle} outputLen=${result.output.length} output=${result.output.take(200)}")
 
+                val shellInfrastructureFailure = name == "shell_execute" &&
+                    !result.success && AndroidNativeTool.isShellInfrastructureFailure(result.output)
+                if (shellInfrastructureFailure) {
+                    shellInfrastructureFailures += 1
+                    if (shellInfrastructureFailures >= 2) {
+                        stopAfterInfrastructureFailure =
+                            "Shell failed to start twice. The agent loop was stopped to prevent repeated package installs."
+                    }
+                } else if (name == "shell_execute" && result.success) {
+                    shellInfrastructureFailures = 0
+                }
+
                 // Record post-execution. WARNING text is appended to the tool
                 // result so the model sees it on its next turn. No block here —
                 // CRITICAL only fires from check() and we already returned above.
@@ -6858,12 +6872,20 @@ class ChatViewModel(
                     errorMessage = errMsgForDetector,
                     toolCallId = id,
                 )
+                val baseOutputForLLM = if (shellInfrastructureFailure) {
+                    result.output +
+                        "\n\n<system-reminder>Shell infrastructure is unavailable. Do not retry " +
+                        "shell_execute or vary package-install commands. Use android_native for " +
+                        "phone capabilities, otherwise report the failure.</system-reminder>"
+                } else {
+                    result.output
+                }
                 val outputForLLM = if (postRecord.level == Level.WARNING && postRecord.message != null) {
                     AppLogger.debug("ChatViewModel",
                         "appending loop-warning to tool result name=$name key=${postRecord.warningKey}")
-                    "${result.output}\n\n${postRecord.message}"
+                    "$baseOutputForLLM\n\n${postRecord.message}"
                 } else {
-                    result.output
+                    baseOutputForLLM
                 }
 
                 val blockIdx = allToolBlocks.indexOfFirst { it.id == id }
@@ -6962,6 +6984,17 @@ class ChatViewModel(
                 contentParts = resultParts,
                 dbMessageId = toolResultDbId,
             ))
+
+            val infrastructureStopMessage = stopAfterInfrastructureFailure
+            if (infrastructureStopMessage != null) {
+                AppLogger.warning(TAG_STREAM, "Stopping agent loop after repeated shell startup failure")
+                withContext(Dispatchers.Main) {
+                    updateAssistantMessage(assistantId, accumulatedText, false, allToolBlocks)
+                    setInlineError(infrastructureStopMessage)
+                }
+                loopExitedNormally = true
+                break
+            }
 
             // Auto-title after first exchange (mirrors iOS generateSessionTitleIfNeeded)
             if (turn == 0) {
@@ -7148,7 +7181,9 @@ class ChatViewModel(
             AndroidNativeTool.NAME -> AndroidNativeTool.execute(
                 argsJson = argsJson,
                 sessionId = activeSessionId,
-                userIntent = agentHistory.lastOrNull { it.role == LLMMessage.Role.USER }?.content,
+                userIntent = agentHistory.lastOrNull {
+                    it.role == LLMMessage.Role.USER && it.content.isNotBlank()
+                }?.content,
             )
             "shell_execute" -> executeShellCommand(argsJson, toolId, toolBlocks, assistantId, currentText)
             "browser_use" -> executeBrowserUseTool(argsJson)
@@ -7258,6 +7293,9 @@ class ChatViewModel(
                 commandLine = command,
                 sessionId = dispatchSessionId,
                 toolTitle = toolTitle,
+                userIntent = agentHistory.lastOrNull {
+                    it.role == LLMMessage.Role.USER && it.content.isNotBlank()
+                }?.content,
             )?.let { return it }
 
             // [diag] sessionId vs realSessionId mismatch was the root cause

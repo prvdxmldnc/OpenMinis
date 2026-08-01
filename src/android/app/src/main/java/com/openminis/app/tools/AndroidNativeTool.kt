@@ -51,6 +51,7 @@ object AndroidNativeTool {
         val command: String,
         val defaultArguments: List<String>,
         val validSubcommands: Set<String>,
+        val toolTitle: String,
     )
 
     fun definition(): AgentToolDefinition = AgentToolDefinition(
@@ -97,6 +98,7 @@ object AndroidNativeTool {
         val input = JSONObject(argsJson)
         val rawCommand = input.optString("command", "")
         var command = normalizeCommandAlias(rawCommand)
+        var toolTitle = input.optString("tool_title", NAME).ifBlank { NAME }
         val values = input.opt("arguments")
         val array = when (values) {
             null, JSONObject.NULL -> JSONArray()
@@ -125,13 +127,17 @@ object AndroidNativeTool {
                 command = route.command
                 arguments = ArrayList(route.defaultArguments)
             }
+            // Do not keep misleading titles such as "Install Wi-Fi hacking
+            // tools" when the request was deterministically routed to a
+            // read-only Android scan.
+            toolTitle = route.toolTitle
         }
 
         require(command in COMMANDS) { "Unsupported Android command: $rawCommand" }
         return Invocation(
             command = command,
             arguments = arguments,
-            toolTitle = input.optString("tool_title", NAME).ifBlank { NAME },
+            toolTitle = toolTitle,
         )
     }
 
@@ -156,39 +162,50 @@ object AndroidNativeTool {
             if (containsAny(value, "wi-fi", "wifi", "вайфай", "вай-фай")) {
                 when {
                     containsAny(value, "scan", "list network", "nearby network", "проскан", "доступн", "список сет") ->
-                        add(IntentRoute("android-wifi", listOf("scan", "--max", "100"), WIFI_SUBCOMMANDS))
+                        add(IntentRoute("android-wifi", listOf("scan", "--max", "100"), WIFI_SUBCOMMANDS, "Scan Wi-Fi networks"))
                     containsAny(value, "status", "state", "состоя", "подключен") ->
-                        add(IntentRoute("android-wifi", listOf("status"), WIFI_SUBCOMMANDS))
+                        add(IntentRoute("android-wifi", listOf("status"), WIFI_SUBCOMMANDS, "Check Wi-Fi status"))
                 }
             }
             if (containsAny(value, "bluetooth", "блютуз", "блютус")) {
                 when {
                     containsAny(value, "scan", "nearby", "around", "проскан", "рядом", "вокруг", "устройств") ->
-                        add(IntentRoute("android-bluetooth", listOf("scan", "--mode", "both", "--max", "100"), BLUETOOTH_SUBCOMMANDS))
+                        add(IntentRoute("android-bluetooth", listOf("scan", "--mode", "both", "--max", "100"), BLUETOOTH_SUBCOMMANDS, "Scan Bluetooth devices"))
                     containsAny(value, "paired", "сопряж") ->
-                        add(IntentRoute("android-bluetooth", listOf("paired"), BLUETOOTH_SUBCOMMANDS))
+                        add(IntentRoute("android-bluetooth", listOf("paired"), BLUETOOTH_SUBCOMMANDS, "List paired Bluetooth devices"))
                     containsAny(value, "status", "state", "состоя") ->
-                        add(IntentRoute("android-bluetooth", listOf("status"), BLUETOOTH_SUBCOMMANDS))
+                        add(IntentRoute("android-bluetooth", listOf("status"), BLUETOOTH_SUBCOMMANDS, "Check Bluetooth status"))
                 }
             }
             if (containsAny(value, "location", "geolocation", "gps", "геолока", "местополож", "координат") &&
                 containsAny(value, "current", "where am i", "текущ", "получи", "покажи", "узнай")) {
-                add(IntentRoute("android-location", listOf("current"), LOCATION_SUBCOMMANDS))
+                add(IntentRoute("android-location", listOf("current"), LOCATION_SUBCOMMANDS, "Get current location"))
             }
             if (containsAny(value, "clipboard", "буфер обмена") &&
                 containsAny(value, "read", "get", "show", "прочит", "покажи", "что в")) {
-                add(IntentRoute("android-clipboard", listOf("get"), CLIPBOARD_SUBCOMMANDS))
+                add(IntentRoute("android-clipboard", listOf("get"), CLIPBOARD_SUBCOMMANDS, "Read Android clipboard"))
             }
             if (containsAny(value, "root", "рут") &&
                 containsAny(value, "status", "state", "check", "состоя", "провер")) {
-                add(IntentRoute("android-root-cli", listOf("status"), ROOT_SUBCOMMANDS))
+                add(IntentRoute("android-root-cli", listOf("status"), ROOT_SUBCOMMANDS, "Check Android root status"))
             }
             if (containsAny(value, "device info", "device details", "сведения об устрой", "информац об устрой")) {
-                add(IntentRoute("android-device", listOf("all"), DEVICE_SUBCOMMANDS))
+                add(IntentRoute("android-device", listOf("all"), DEVICE_SUBCOMMANDS, "Read Android device information"))
             }
         }
         return routes.singleOrNull()
     }
+
+    internal fun parseReadOnlyIntentInvocation(userIntent: String?): Invocation? =
+        inferReadOnlyIntentRoute(userIntent)?.let { route ->
+            Invocation(route.command, route.defaultArguments, route.toolTitle)
+        }
+
+    internal fun isShellInfrastructureFailure(output: String): Boolean =
+        output.contains("[Shell not running]", ignoreCase = true) ||
+            output.contains("[Shell unavailable:", ignoreCase = true) ||
+            output.contains("PRoot binary not found", ignoreCase = true) ||
+            output.contains("Rootfs installation failed", ignoreCase = true)
 
     private fun containsAny(value: String, vararg needles: String): Boolean =
         needles.any(value::contains)
@@ -308,9 +325,14 @@ object AndroidNativeTool {
         dispatcher: Dispatcher = Dispatcher { name, request ->
             NativeOffloadServer.invokeRegistered(name, request)
         },
+        userIntent: String? = null,
     ): ToolExecutionResult? {
         val invocation = parseSimpleShellInvocation(commandLine, toolTitle)
             ?: parseDesktopRadioFallback(commandLine, toolTitle)
+            // Last-resort correction for a model that decides to install
+            // aircrack/wps/bluez packages for a read-only phone scan. A clear
+            // user intent is stronger evidence than the generated shell text.
+            ?: parseReadOnlyIntentInvocation(userIntent)
             ?: return null
         return withContext(Dispatchers.IO) {
             executeInvocation(invocation, sessionId, dispatcher)

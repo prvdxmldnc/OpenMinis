@@ -205,6 +205,25 @@ class AndroidNativeToolTest {
     }
 
     @Test
+    fun `Wi-Fi scan intent overrides package installation loop`() = runBlocking {
+        var argv: List<String>? = null
+        val result = AndroidNativeTool.executeSimpleShellCommandIfSupported(
+            "apk add wps-nfc aircrack-ng-standalone python3",
+            "session",
+            "Install Wi-Fi hacking tools",
+            AndroidNativeTool.Dispatcher { _, request ->
+                argv = request.argv
+                NativeOffloadResult(0, "{\"networks\":[]}")
+            },
+            userIntent = "Просканируй доступные Wi-Fi сети.",
+        )
+        assertNotNull(result)
+        assertTrue(result!!.success)
+        assertEquals("Scan Wi-Fi networks", result.toolTitle)
+        assertEquals(listOf("android-wifi", "scan", "--max", "100"), argv)
+    }
+
+    @Test
     fun `desktop Bluetooth scan is safely redirected to Android`() {
         val invocation = AndroidNativeTool.parseDesktopRadioFallback(
             "timeout 12 bluetoothctl scan on",
@@ -222,6 +241,19 @@ class AndroidNativeToolTest {
             "scan",
         ))
         assertNull(AndroidNativeTool.parseDesktopRadioFallback("lspci -nn", "hardware"))
+    }
+
+    @Test
+    fun `shell infrastructure failure signatures are detected`() {
+        assertTrue(AndroidNativeTool.isShellInfrastructureFailure(
+            "[Shell not running]\n(exit code: -1)",
+        ))
+        assertTrue(AndroidNativeTool.isShellInfrastructureFailure(
+            "[Shell unavailable: PRoot exited during startup (code 1)]",
+        ))
+        assertFalse(AndroidNativeTool.isShellInfrastructureFailure(
+            "ERROR: unable to select packages: aircrack-ng",
+        ))
     }
 
     @Test

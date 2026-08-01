@@ -40,6 +40,11 @@ class PersistentShell(
 
     private val isStarting = AtomicBoolean(false)
 
+    @Volatile
+    private var lastStartFailure: String? = null
+
+    private val startupStderrTail = StringBuilder()
+
     /** Pending command callback — only one command at a time. */
     @Volatile
     private var pendingCallback: CommandCallback? = null
@@ -80,6 +85,8 @@ class PersistentShell(
 
     private fun startProcess() {
         Log.i(TAG, "Starting persistent shell process")
+        lastStartFailure = null
+        synchronized(startupStderrTail) { startupStderrTail.setLength(0) }
 
         val rootfsManager = RootfsManager.getInstance(context)
 
@@ -163,7 +170,10 @@ class PersistentShell(
             Thread({
                 val br = p.errorStream.bufferedReader(StandardCharsets.UTF_8)
                 try {
-                    for (line in br.lineSequence()) Log.d("PRootStderr", line)
+                    for (line in br.lineSequence()) {
+                        appendStartupStderr(line)
+                        Log.d("PRootStderr", line)
+                    }
                 } catch (_: Exception) {}
             }, "PersistentShell-stderr").apply {
                 isDaemon = true
@@ -176,7 +186,11 @@ class PersistentShell(
             Thread.sleep(200)
         } catch (_: InterruptedException) {}
 
-        Log.i(TAG, "Persistent shell started")
+        if (p.isAlive) {
+            Log.i(TAG, "Persistent shell started")
+        } else {
+            captureExitFailure(p, "during startup")
+        }
     }
 
     private fun readLoop(p: Process) {
@@ -229,9 +243,33 @@ class PersistentShell(
             pendingCallback = null
         }
 
+        captureExitFailure(p, "unexpectedly")
         process = null
         stdinWriter = null
         Log.i(TAG, "Persistent shell process exited")
+    }
+
+    private fun appendStartupStderr(line: String) {
+        synchronized(startupStderrTail) {
+            startupStderrTail.append(line).append('\n')
+            if (startupStderrTail.length > 4_000) {
+                startupStderrTail.delete(0, startupStderrTail.length - 4_000)
+            }
+        }
+    }
+
+    private fun captureExitFailure(p: Process, phase: String) {
+        if (lastStartFailure != null) return
+        val exitCode = runCatching { p.exitValue() }.getOrNull()
+        val stderr = synchronized(startupStderrTail) {
+            startupStderrTail.toString().trim().takeLast(1_000)
+        }
+        lastStartFailure = buildString {
+            append("PRoot exited ").append(phase)
+            if (exitCode != null) append(" (code ").append(exitCode).append(')')
+            if (stderr.isNotBlank()) append(": ").append(stderr)
+        }
+        lastStartFailure?.let { Log.e(TAG, it) }
     }
 
     private fun feedLines(text: String, callback: (String) -> Unit) {
@@ -271,7 +309,8 @@ class PersistentShell(
 
         val writer = stdinWriter
         if (writer == null || !isAlive) {
-            return Pair("[Shell not running]", -1)
+            val detail = lastStartFailure ?: "PRoot process is not running"
+            return Pair("[Shell unavailable: $detail]", -1)
         }
 
         val marker = UUID.randomUUID().toString().take(8)
