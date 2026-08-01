@@ -165,6 +165,12 @@ class DebugRPCHandler(private val context: Context) {
                 }
                 handleShizukuExec(params)
             }
+            "debug.termux.exec" -> {
+                if (!BuildConfig.DEBUG) {
+                    throw RPCException(-32601, "Method not found: $method. Call 'rpc.discover' to list available methods.")
+                }
+                handleTermuxExec(params)
+            }
             "debug.modelUse.exec" -> {
                 if (!BuildConfig.DEBUG) {
                     throw RPCException(-32601, "Method not found: $method. Call 'rpc.discover' to list available methods.")
@@ -1025,6 +1031,40 @@ class DebugRPCHandler(private val context: Context) {
         val request = com.openminis.app.sandbox.NativeOffloadRequest(
             pid = -1,
             argv = listOf("android-shizuku-cli") + argvTail,
+            env = emptyMap(),
+            cwd = "/",
+            sessionId = null,
+        )
+        val result = handler.handle(request)
+        return JSONObject().apply {
+            put("exitCode", result.exitCode)
+            put("output", result.output)
+            put("argv", JSONArray(argvTail))
+        }
+    }
+
+    /** Direct production-handler smoke test for Termux RUN_COMMAND. */
+    private fun handleTermuxExec(params: JSONObject): JSONObject {
+        val argvTail: List<String> = when {
+            params.has("args") -> {
+                val arr = params.optJSONArray("args")
+                    ?: throw RPCException(-32602, "args must be an array of strings")
+                List(arr.length()) { index ->
+                    val value = arr.opt(index)
+                    if (value !is String) throw RPCException(-32602, "args must contain only strings")
+                    value
+                }
+            }
+            params.has("command") -> {
+                params.optString("command").trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+            }
+            else -> throw RPCException(-32602, "Missing 'args' (array) or 'command' (string)")
+        }
+        AppLogger.info("DebugRPC", "debug.termux.exec argc=${argvTail.size}")
+        val handler = com.openminis.app.sandbox.offload.TermuxOffloadHandler(context)
+        val request = com.openminis.app.sandbox.NativeOffloadRequest(
+            pid = -1,
+            argv = listOf("android-termux-cli") + argvTail,
             env = emptyMap(),
             cwd = "/",
             sessionId = null,

@@ -33,6 +33,7 @@ class AndroidNativeToolTest {
         val commands = properties.getJSONObject("command").getJSONArray("enum")
         assertTrue((0 until commands.length()).any { commands.getString(it) == "android-wifi" })
         assertTrue((0 until commands.length()).any { commands.getString(it) == "android-root-cli" })
+        assertTrue((0 until commands.length()).any { commands.getString(it) == "android-termux-cli" })
     }
 
     @Test
@@ -171,6 +172,7 @@ class AndroidNativeToolTest {
             "android-a11y-cli",
             "android-shizuku-cli",
             "android-root-cli",
+            "android-termux-cli",
         )))
         assertEquals(AndroidNativeTool.COMMANDS.size, AndroidNativeTool.COMMANDS.distinct().size)
     }

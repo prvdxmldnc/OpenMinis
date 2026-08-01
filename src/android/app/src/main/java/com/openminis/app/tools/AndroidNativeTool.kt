@@ -33,6 +33,7 @@ object AndroidNativeTool {
         "android-bluetooth",
         "android-hardware",
         "android-root-cli",
+        "android-termux-cli",
         "android-shizuku-cli",
         "android-a11y-cli",
     )
@@ -65,7 +66,7 @@ object AndroidNativeTool {
             "Use Android framework capabilities on the phone directly. Always use this " +
                 "instead of shell_execute/nmcli/iw/bluetoothctl for Wi-Fi, Bluetooth, " +
                 "device hardware, location, contacts, notifications, media, speech, " +
-                "Accessibility, Shizuku, or an existing root backend. The command is one " +
+                "Accessibility, Shizuku, Termux/NetHunter, or an existing root backend. The command is one " +
                 "of the android-* CLIs documented in the system prompt; arguments are the " +
                 "same tokens that follow that CLI name. Example Wi-Fi scan: command=" +
                 "android-wifi, arguments=[\"scan\",\"--max\",\"100\"].",
@@ -80,7 +81,7 @@ object AndroidNativeTool {
                     "android-wifi; Bluetooth=android-bluetooth; GPS/location=" +
                     "android-location; clipboard=android-clipboard; device info=" +
                     "android-device; hardware/sensors=android-hardware; root=" +
-                    "android-root-cli; Shizuku=android-shizuku-cli; Accessibility=" +
+                    "android-root-cli; Termux/Kali=android-termux-cli; Shizuku=android-shizuku-cli; Accessibility=" +
                     "android-a11y-cli.",
                 enumValues = COMMANDS,
             ),
@@ -155,6 +156,7 @@ object AndroidNativeTool {
         "device", "android_device" -> "android-device"
         "hardware", "android_hardware" -> "android-hardware"
         "root", "root-status", "android_root" -> "android-root-cli"
+        "termux", "kali", "nethunter", "android_termux" -> "android-termux-cli"
         "shizuku", "android_shizuku" -> "android-shizuku-cli"
         "accessibility", "a11y", "android_accessibility" -> "android-a11y-cli"
         else -> command

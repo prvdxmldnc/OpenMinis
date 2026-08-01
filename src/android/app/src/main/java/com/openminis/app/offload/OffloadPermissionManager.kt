@@ -90,6 +90,7 @@ object OffloadPermissionManager {
         ToolPermissionInfo("bluetooth_cli", "android-bluetooth", PermissionCategory.INTEGRATIONS, PermissionLevel.BYPASS),
         ToolPermissionInfo("hardware_cli", "android-hardware", PermissionCategory.INTEGRATIONS, PermissionLevel.BYPASS),
         ToolPermissionInfo("root_cli", "android-root-cli", PermissionCategory.INTEGRATIONS, PermissionLevel.BYPASS),
+        ToolPermissionInfo("termux_cli", "android-termux-cli", PermissionCategory.INTEGRATIONS, PermissionLevel.BYPASS),
     )
 
     /** Stable session-id used by NativeOffloadHandlers when calling

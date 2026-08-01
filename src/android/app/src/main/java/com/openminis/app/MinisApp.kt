@@ -49,6 +49,7 @@ import com.openminis.app.sandbox.offload.ModelUseOffloadHandler
 import com.openminis.app.sandbox.offload.SessionsOffloadHandler
 import com.openminis.app.sandbox.offload.ShizukuOffloadHandler
 import com.openminis.app.sandbox.offload.RootOffloadHandler
+import com.openminis.app.sandbox.offload.TermuxOffloadHandler
 import com.openminis.app.sandbox.offload.NotificationOffloadHandler
 import com.openminis.app.sandbox.offload.OpenOffloadHandler
 import com.openminis.app.sandbox.offload.PhotosOffloadHandler
@@ -393,6 +394,7 @@ class MinisApp : Application(), ImageLoaderFactory {
         NativeOffloadServer.register("android-bluetooth", BluetoothOffloadHandler(this))
         NativeOffloadServer.register("android-hardware", HardwareOffloadHandler(this))
         NativeOffloadServer.register("android-root-cli", RootOffloadHandler())
+        NativeOffloadServer.register("android-termux-cli", TermuxOffloadHandler(this))
         // T323: UI-layer automation backed by MinisAccessibilityService.
         NativeOffloadServer.register("android-a11y-cli", AccessibilityOffloadHandler(this))
         NativeOffloadServer.register("minis-model-use", ModelUseOffloadHandler(this, providerRepository))

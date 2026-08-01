@@ -3,6 +3,9 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Official Termux RUN_COMMAND bridge. This dangerous permission is
+         defined by Termux and must be granted explicitly by the user. -->
+    <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
     <!-- T33: Check Update — needed to launch the system installer for the
          downloaded APK. The user must additionally grant "install unknown
          apps" for this package the first time they upgrade. -->
@@ -161,6 +164,9 @@
         <!-- [T-android-privileged-backend] AXManager — same package-visibility
              need so PrivilegedBackend can detect/launch it under Android 11+. -->
         <package android:name="frb.axeron.manager" />
+        <!-- Android 11+ package visibility for the explicit Termux
+             RunCommandService integration. -->
+        <package android:name="com.termux" />
         <!-- Crash-share dialog: ACTION_SENDTO mailto: needs explicit
              visibility under Android 11+ before resolveActivity / startActivity
              will return a real email-app candidate. Without it the
@@ -460,6 +466,12 @@
             android:name=".service.AgentForegroundService"
             android:exported="false"
             android:foregroundServiceType="mediaPlayback" />
+
+        <!-- Receives stdout/stderr/exitCode from Termux through the mutable,
+             one-shot PendingIntent supplied with each RUN_COMMAND request. -->
+        <receiver
+            android:name=".sandbox.offload.TermuxResultReceiver"
+            android:exported="false" />
 
         <!-- Alarm broadcast receiver (also handles BOOT_COMPLETED for re-scheduling) -->
         <receiver

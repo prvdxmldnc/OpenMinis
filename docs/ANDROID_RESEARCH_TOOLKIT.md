@@ -16,6 +16,9 @@ the phone's radios. Use the native `android-*` commands below instead.
 3. AXManager/Shizuku started as root, or an existing `su`, provides UID 0 to
    `android-root-cli exec`. No command allow-list is applied by this fork.
 4. `android-a11y-cli` supplies cross-application UI inspection and automation.
+5. The official Termux `RUN_COMMAND` service connects Minis to a separately
+   installed Termux or Kali NetHunter Rootless environment and returns stdout,
+   stderr, and the exit code to the agent.
 
 The app does not contain a root exploit and cannot silently grant itself an
 Android dangerous permission. The Android permission dialog, Bluetooth pairing
@@ -98,6 +101,35 @@ android-root-cli exec 'iptables -L -n -v'
 Output is capped at 1 MiB per stream so an unbounded command cannot exhaust the
 app process; the command itself may write arbitrarily large data to a file.
 
+### Termux and NetHunter Rootless
+
+```sh
+android-termux-cli status
+android-termux-cli exec --timeout-ms 120000 'uname -a'
+android-termux-cli nethunter --timeout-ms 120000 'cat /etc/os-release'
+android-termux-cli nethunter 'aircrack-ng --help'
+```
+
+This bridge uses Termux's documented `RUN_COMMAND` Android service; it does not
+read Termux's private data directory from the Minis process. Setup has two
+independent consent gates:
+
+1. Grant Minis the Android **Run commands in Termux environment** additional
+   permission (`com.termux.permission.RUN_COMMAND`).
+2. Add `allow-external-apps=true` to
+   `~/.termux/termux.properties` inside Termux.
+
+`exec` runs the command with Termux bash. `nethunter` runs it through the
+installed NetHunter Rootless launcher as the PRoot root user. Output returned
+by Termux is subject to Android Binder limits and Termux's own result cap; the
+response reports whether it was truncated.
+
+This adds Linux userland and package availability, not kernel functionality.
+The internal Android Wi-Fi chipset still cannot enter monitor mode or inject
+frames unless the device kernel and driver expose those features. Use
+`android-wifi scan` for ordinary Android discovery and a supported external
+adapter/kernel for monitor-mode workflows.
+
 ## Credentials and privacy mode
 
 This research fork permits the agent to read and pass credentials when a task
@@ -120,13 +152,17 @@ place; this does not prevent a requested command from using the real value.
 4. Enable the Minis Accessibility service if cross-app UI control is needed.
 5. Install/start Shizuku for ADB-shell capabilities, or AXManager/root-started
    Shizuku for UID 0, and authorize Minis.
-6. Verify from a chat or terminal:
+6. If Termux/NetHunter integration is needed, enable
+   `allow-external-apps=true` in Termux and grant Minis the additional
+   **Run commands in Termux environment** permission.
+7. Verify from a chat or terminal:
 
 ```sh
 android-wifi status
 android-bluetooth status
 android-shizuku-cli service status
 android-root-cli status
+android-termux-cli status
 ```
 
 The build now fails before compilation if the Alpine rootfs, the PRoot asset,
