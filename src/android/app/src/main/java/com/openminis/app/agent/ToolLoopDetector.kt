@@ -42,11 +42,19 @@ data class ToolLoopConfig(
     val historySize: Int = 30,
     val warningThreshold: Int = 10,
     val unknownToolThreshold: Int = 10,
+    val androidNoProgressCriticalThreshold: Int = 3,
     val criticalThreshold: Int = 20,
     val globalCircuitBreakerThreshold: Int = 30,
 ) {
     init {
         require(warningThreshold > 0) { "warningThreshold must be positive" }
+        require(androidNoProgressCriticalThreshold > 0) {
+            "androidNoProgressCriticalThreshold must be positive"
+        }
+        require(androidNoProgressCriticalThreshold < globalCircuitBreakerThreshold) {
+            "androidNoProgressCriticalThreshold ($androidNoProgressCriticalThreshold) must be < " +
+                "globalCircuitBreakerThreshold ($globalCircuitBreakerThreshold)"
+        }
         require(warningThreshold < criticalThreshold) {
             "warningThreshold ($warningThreshold) must be < criticalThreshold ($criticalThreshold)"
         }
@@ -60,14 +68,15 @@ data class ToolLoopConfig(
 }
 
 /**
- * Detects four classes of agent tool-call loops and emits warnings or hard
+ * Detects five classes of agent tool-call loops and emits warnings or hard
  * blocks. See fix_tool_loop_detection.md for the full behavioral spec.
  *
  * Strategy priority (highest first):
  *   1. unknown_tool_repeat       — consecutive hallucinated-tool errors.
- *   2. global_circuit_breaker    — same args + same result, ≥30 across any tool.
- *   3. known_poll_no_progress    — poll-style tool with frozen results.
- *   4. generic_repeat            — same args ≥10, regardless of result.
+ *   2. android_no_progress       — corrected Android-native call frozen ≥3 times.
+ *   3. global_circuit_breaker    — same args + same result, ≥30 across any tool.
+ *   4. known_poll_no_progress    — poll-style tool with frozen results.
+ *   5. generic_repeat            — same args ≥10, regardless of result.
  *
  * One detector instance per Session. Not thread-safe; serialize calls
  * through the agent loop's existing single-threaded dispatch.
@@ -110,7 +119,23 @@ class ToolLoopDetector(private val config: ToolLoopConfig = ToolLoopConfig()) {
 
         val noProgressStreak = getNoProgressStreak(toolName, argsHash)
 
-        // 2. global_circuit_breaker — universal backstop, before poll-specific
+        // 2. Android-native actions are short and deterministic. Repeating the
+        //    same failed framework call cannot make progress by itself and used
+        //    to grow 16K local-model conversations until the provider rejected
+        //    the entire request. Stop before another call is dispatched.
+        if (toolName == "android_native" &&
+            noProgressStreak >= config.androidNoProgressCriticalThreshold) {
+            val msg = "[LOOP BLOCKED] CRITICAL: Android action repeated the same " +
+                "no-progress result $noProgressStreak times. Stop retrying it and " +
+                "report the Android permission or capability error to the user."
+            AppLogger.warning(
+                "ToolLoopDetector",
+                "CRITICAL android_no_progress tool=$toolName streak=$noProgressStreak",
+            )
+            return LoopCheckResult(Level.CRITICAL, msg)
+        }
+
+        // 3. global_circuit_breaker — universal backstop, before poll-specific
         //    rule so a runaway non-poll loop can't slip past on lower thresholds.
         if (noProgressStreak >= config.globalCircuitBreakerThreshold) {
             val msg = "[LOOP BLOCKED] CRITICAL: $toolName has repeated identical " +
@@ -121,7 +146,7 @@ class ToolLoopDetector(private val config: ToolLoopConfig = ToolLoopConfig()) {
             return LoopCheckResult(Level.CRITICAL, msg)
         }
 
-        // 3. known_poll_no_progress — poll tools have a tighter critical bar
+        // 4. known_poll_no_progress — poll tools have a tighter critical bar
         //    because polling without progress is the canonical waste case.
         if (isPollTool(toolName, params)) {
             if (noProgressStreak >= config.criticalThreshold) {
@@ -141,7 +166,7 @@ class ToolLoopDetector(private val config: ToolLoopConfig = ToolLoopConfig()) {
             }
         }
 
-        // 4. generic_repeat — non-poll tools only; counts non-consecutive hits
+        // 5. generic_repeat — non-poll tools only; counts non-consecutive hits
         //    so flaky-but-progressing calls eventually fall out of the window.
         if (!isPollTool(toolName, params)) {
             val totalCount = history.count { it.toolName == toolName && it.argsHash == argsHash }

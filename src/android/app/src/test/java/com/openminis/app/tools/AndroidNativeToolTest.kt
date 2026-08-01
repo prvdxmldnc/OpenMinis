@@ -125,6 +125,42 @@ class AndroidNativeToolTest {
     }
 
     @Test
+    fun `authorization acknowledgement inherits prior read-only phone intent`() {
+        val resolved = AndroidNativeTool.resolveContinuationIntent(
+            listOf(
+                "авторизовал",
+                "Просканируй доступные Wi-Fi сети телефона.",
+            ),
+        )
+        assertEquals("Просканируй доступные Wi-Fi сети телефона.", resolved)
+    }
+
+    @Test
+    fun `substantive unrelated message does not resurrect stale phone intent`() {
+        val resolved = AndroidNativeTool.resolveContinuationIntent(
+            listOf(
+                "Напиши короткое письмо клиенту.",
+                "Просканируй доступные Wi-Fi сети телефона.",
+            ),
+        )
+        assertNull(resolved)
+    }
+
+    @Test
+    fun `scan intent corrects valid but wrong Wi-Fi subcommand`() {
+        val invocation = AndroidNativeTool.parseInvocation(
+            JSONObject()
+                .put("tool_title", "Check WPA status")
+                .put("command", "android-wifi")
+                .put("arguments", JSONArray(listOf("status")))
+                .toString(),
+            "Просканируй доступные Wi-Fi сети телефона.",
+        )
+        assertEquals("android-wifi", invocation.command)
+        assertEquals(listOf("scan", "--max", "100"), invocation.arguments)
+    }
+
+    @Test
     fun `all research surfaces are available through command enum`() {
         assertTrue(AndroidNativeTool.COMMANDS.containsAll(listOf(
             "android-wifi",
@@ -221,6 +257,50 @@ class AndroidNativeToolTest {
         assertTrue(result!!.success)
         assertEquals("Scan Wi-Fi networks", result.toolTitle)
         assertEquals(listOf("android-wifi", "scan", "--max", "100"), argv)
+    }
+
+    @Test
+    fun `Wi-Fi continuation overrides malformed Shizuku command`() = runBlocking {
+        var argv: List<String>? = null
+        val result = AndroidNativeTool.executeSimpleShellCommandIfSupported(
+            "android-shizuku-cli exec w",
+            "session",
+            "Check WPA status",
+            AndroidNativeTool.Dispatcher { _, request ->
+                argv = request.argv
+                NativeOffloadResult(0, "{\"networks\":[]}")
+            },
+            userIntent = "Просканируй доступные Wi-Fi сети телефона.",
+        )
+        assertNotNull(result)
+        assertEquals("Scan Wi-Fi networks", result!!.toolTitle)
+        assertEquals(listOf("android-wifi", "scan", "--max", "100"), argv)
+    }
+
+    @Test
+    fun `native and shell Wi-Fi mistakes share one canonical loop identity`() {
+        val intent = "Просканируй доступные Wi-Fi сети телефона."
+        val native = AndroidNativeTool.canonicalLoopIdentity(
+            AndroidNativeTool.NAME,
+            JSONObject()
+                .put("tool_title", "Check WPA status")
+                .put("command", "android-shizuku-cli")
+                .put("arguments", JSONArray(listOf("exec", "w")))
+                .toString(),
+            intent,
+        )
+        val shell = AndroidNativeTool.canonicalLoopIdentity(
+            "shell_execute",
+            JSONObject()
+                .put("tool_title", "Try another WPA check")
+                .put("command", "w")
+                .toString(),
+            intent,
+        )
+        assertNotNull(native)
+        assertEquals(native, shell)
+        assertEquals("android-wifi", native!!.params["command"])
+        assertEquals(listOf("scan", "--max", "100"), native.params["arguments"])
     }
 
     @Test

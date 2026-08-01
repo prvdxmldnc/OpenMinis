@@ -43,6 +43,12 @@ object AndroidNativeTool {
         val toolTitle: String,
     )
 
+    /** Stable identity used by the agent loop regardless of how the model expressed the call. */
+    internal data class LoopIdentity(
+        val toolName: String,
+        val params: Map<String, Any?>,
+    )
+
     internal fun interface Dispatcher {
         fun dispatch(name: String, request: NativeOffloadRequest): NativeOffloadResult
     }
@@ -50,7 +56,6 @@ object AndroidNativeTool {
     private data class IntentRoute(
         val command: String,
         val defaultArguments: List<String>,
-        val validSubcommands: Set<String>,
         val toolTitle: String,
     )
 
@@ -123,7 +128,8 @@ object AndroidNativeTool {
         // text is inspected in memory and is never logged or returned.
         inferReadOnlyIntentRoute(userIntent)?.let { route ->
             val modelSubcommand = arguments.firstOrNull()
-            if (command != route.command || modelSubcommand !in route.validSubcommands) {
+            val intendedSubcommand = route.defaultArguments.firstOrNull()
+            if (command != route.command || modelSubcommand != intendedSubcommand) {
                 command = route.command
                 arguments = ArrayList(route.defaultArguments)
             }
@@ -162,44 +168,110 @@ object AndroidNativeTool {
             if (containsAny(value, "wi-fi", "wifi", "вайфай", "вай-фай")) {
                 when {
                     containsAny(value, "scan", "list network", "nearby network", "проскан", "доступн", "список сет") ->
-                        add(IntentRoute("android-wifi", listOf("scan", "--max", "100"), WIFI_SUBCOMMANDS, "Scan Wi-Fi networks"))
+                        add(IntentRoute("android-wifi", listOf("scan", "--max", "100"), "Scan Wi-Fi networks"))
                     containsAny(value, "status", "state", "состоя", "подключен") ->
-                        add(IntentRoute("android-wifi", listOf("status"), WIFI_SUBCOMMANDS, "Check Wi-Fi status"))
+                        add(IntentRoute("android-wifi", listOf("status"), "Check Wi-Fi status"))
                 }
             }
             if (containsAny(value, "bluetooth", "блютуз", "блютус")) {
                 when {
                     containsAny(value, "scan", "nearby", "around", "проскан", "рядом", "вокруг", "устройств") ->
-                        add(IntentRoute("android-bluetooth", listOf("scan", "--mode", "both", "--max", "100"), BLUETOOTH_SUBCOMMANDS, "Scan Bluetooth devices"))
+                        add(IntentRoute("android-bluetooth", listOf("scan", "--mode", "both", "--max", "100"), "Scan Bluetooth devices"))
                     containsAny(value, "paired", "сопряж") ->
-                        add(IntentRoute("android-bluetooth", listOf("paired"), BLUETOOTH_SUBCOMMANDS, "List paired Bluetooth devices"))
+                        add(IntentRoute("android-bluetooth", listOf("paired"), "List paired Bluetooth devices"))
                     containsAny(value, "status", "state", "состоя") ->
-                        add(IntentRoute("android-bluetooth", listOf("status"), BLUETOOTH_SUBCOMMANDS, "Check Bluetooth status"))
+                        add(IntentRoute("android-bluetooth", listOf("status"), "Check Bluetooth status"))
                 }
             }
             if (containsAny(value, "location", "geolocation", "gps", "геолока", "местополож", "координат") &&
                 containsAny(value, "current", "where am i", "текущ", "получи", "покажи", "узнай")) {
-                add(IntentRoute("android-location", listOf("current"), LOCATION_SUBCOMMANDS, "Get current location"))
+                add(IntentRoute("android-location", listOf("current"), "Get current location"))
             }
             if (containsAny(value, "clipboard", "буфер обмена") &&
                 containsAny(value, "read", "get", "show", "прочит", "покажи", "что в")) {
-                add(IntentRoute("android-clipboard", listOf("get"), CLIPBOARD_SUBCOMMANDS, "Read Android clipboard"))
+                add(IntentRoute("android-clipboard", listOf("get"), "Read Android clipboard"))
             }
             if (containsAny(value, "root", "рут") &&
                 containsAny(value, "status", "state", "check", "состоя", "провер")) {
-                add(IntentRoute("android-root-cli", listOf("status"), ROOT_SUBCOMMANDS, "Check Android root status"))
+                add(IntentRoute("android-root-cli", listOf("status"), "Check Android root status"))
             }
             if (containsAny(value, "device info", "device details", "сведения об устрой", "информац об устрой")) {
-                add(IntentRoute("android-device", listOf("all"), DEVICE_SUBCOMMANDS, "Read Android device information"))
+                add(IntentRoute("android-device", listOf("all"), "Read Android device information"))
             }
         }
         return routes.singleOrNull()
+    }
+
+    /**
+     * Preserve a read-only phone task across short permission/continuation replies such as
+     * "авторизовал". A substantive unrelated message never resurrects an older task.
+     */
+    internal fun resolveContinuationIntent(userMessagesNewestFirst: List<String>): String? {
+        val messages = userMessagesNewestFirst.map { it.trim() }.filter { it.isNotEmpty() }
+        val latest = messages.firstOrNull() ?: return null
+        if (inferReadOnlyIntentRoute(latest) != null) return latest
+        if (!isContinuationAcknowledgement(latest)) return null
+        return messages.drop(1).firstOrNull { inferReadOnlyIntentRoute(it) != null }
+    }
+
+    private fun isContinuationAcknowledgement(text: String): Boolean {
+        val value = text.lowercase().trim().trim('.', '!', '?', ',', ':', ';')
+        if (value.length > 96) return false
+        return value in CONTINUATION_ACKNOWLEDGEMENTS ||
+            CONTINUATION_ACKNOWLEDGEMENT_PREFIXES.any { prefix -> value.startsWith(prefix) }
     }
 
     internal fun parseReadOnlyIntentInvocation(userIntent: String?): Invocation? =
         inferReadOnlyIntentRoute(userIntent)?.let { route ->
             Invocation(route.command, route.defaultArguments, route.toolTitle)
         }
+
+    /** Resolve the same native route that execution will use for a shell-shaped call. */
+    internal fun resolveShellInvocation(
+        commandLine: String,
+        toolTitle: String,
+        userIntent: String? = null,
+    ): Invocation? {
+        val generated = parseSimpleShellInvocation(commandLine, toolTitle)
+            ?: parseDesktopRadioFallback(commandLine, toolTitle)
+        val intended = parseReadOnlyIntentInvocation(userIntent)
+        if (intended != null) {
+            val generatedSubcommand = generated?.arguments?.firstOrNull()
+            val intendedSubcommand = intended.arguments.firstOrNull()
+            if (generated == null || generated.command != intended.command ||
+                generatedSubcommand != intendedSubcommand) {
+                return intended
+            }
+        }
+        return generated ?: intended
+    }
+
+    /** Canonicalize native and redirected shell calls before loop detection. */
+    internal fun canonicalLoopIdentity(
+        toolName: String,
+        argsJson: String,
+        userIntent: String? = null,
+    ): LoopIdentity? = runCatching {
+        val invocation = when (toolName) {
+            NAME -> parseInvocation(argsJson, userIntent)
+            "shell_execute" -> {
+                val input = JSONObject(argsJson)
+                resolveShellInvocation(
+                    commandLine = input.optString("command", ""),
+                    toolTitle = input.optString("tool_title", "shell_execute"),
+                    userIntent = userIntent,
+                )
+            }
+            else -> null
+        } ?: return@runCatching null
+        LoopIdentity(
+            toolName = NAME,
+            params = linkedMapOf(
+                "command" to invocation.command,
+                "arguments" to invocation.arguments,
+            ),
+        )
+    }.getOrNull()
 
     internal fun isShellInfrastructureFailure(output: String): Boolean =
         output.contains("[Shell not running]", ignoreCase = true) ||
@@ -327,12 +399,7 @@ object AndroidNativeTool {
         },
         userIntent: String? = null,
     ): ToolExecutionResult? {
-        val invocation = parseSimpleShellInvocation(commandLine, toolTitle)
-            ?: parseDesktopRadioFallback(commandLine, toolTitle)
-            // Last-resort correction for a model that decides to install
-            // aircrack/wps/bluez packages for a read-only phone scan. A clear
-            // user intent is stronger evidence than the generated shell text.
-            ?: parseReadOnlyIntentInvocation(userIntent)
+        val invocation = resolveShellInvocation(commandLine, toolTitle, userIntent)
             ?: return null
         return withContext(Dispatchers.IO) {
             executeInvocation(invocation, sessionId, dispatcher)
@@ -359,10 +426,14 @@ object AndroidNativeTool {
         )
     }
 
-    private val WIFI_SUBCOMMANDS = setOf("status", "scan", "enable", "disable", "saved", "connect", "forget")
-    private val BLUETOOTH_SUBCOMMANDS = setOf("status", "paired", "scan", "pair", "enable", "disable")
-    private val LOCATION_SUBCOMMANDS = setOf("current", "geocode", "forward")
-    private val CLIPBOARD_SUBCOMMANDS = setOf("get", "set", "clear", "status")
-    private val ROOT_SUBCOMMANDS = setOf("status", "exec")
-    private val DEVICE_SUBCOMMANDS = setOf("all", "info", "battery", "storage")
+    private val CONTINUATION_ACKNOWLEDGEMENTS = setOf(
+        "да", "готово", "сделал", "разрешил", "авторизовал", "подключил",
+        "продолжай", "повтори", "можно", "ok", "okay", "done", "ready",
+        "authorized", "authorised", "connected", "continue", "retry",
+    )
+    private val CONTINUATION_ACKNOWLEDGEMENT_PREFIXES = listOf(
+        "авторизовал", "авторизовано", "разрешение дал", "разрешения дал",
+        "разрешил", "подключил shizuku", "shizuku подключ", "permission granted",
+        "access granted", "i authorized", "i authorised", "i connected shizuku",
+    )
 }

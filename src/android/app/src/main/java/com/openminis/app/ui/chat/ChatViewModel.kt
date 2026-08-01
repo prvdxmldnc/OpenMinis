@@ -5527,6 +5527,10 @@ class ChatViewModel(
         var totalChars = 0
         var imageTokens = 0
         for (msg in agentHistory) {
+            // Plain user/assistant text normally lives in `content`, not in a
+            // Text contentPart. Omitting it made the fallback estimate badly
+            // under-count long local-model chats.
+            totalChars += msg.content.length
             for (part in msg.contentParts) {
                 when (part) {
                     is AgentContentPart.Text -> totalChars += part.text.length
@@ -5600,14 +5604,13 @@ class ChatViewModel(
         contextWindow: Int,
         lastContextTokens: Int,
         force: Boolean = false,
-    ) {
+    ): Int {
         val sid = activeSessionId
         val policy = ContextPolicy.forContextWindow(contextWindow)
 
         if (!force && policy.offloadThreshold == 0) {
-            // Small-window tier: offload disabled — UI surfaces "exhausted"
-            // when the user crosses the threshold. Nothing to do here.
-            return
+            // A custom/invalid policy may explicitly disable offload.
+            return 0
         }
 
         val effectiveTokens =
@@ -5616,7 +5619,7 @@ class ChatViewModel(
         if (!force && effectiveTokens < policy.offloadThreshold) {
             // Below threshold — no work needed. Caller logs at debug level
             // via dynamicMaxTokens; we stay silent to keep logs readable.
-            return
+            return 0
         }
 
         val targetTokens = if (force) 0 else policy.offloadTarget
@@ -5643,6 +5646,10 @@ class ChatViewModel(
         val candidates = mutableListOf<OffloadCandidate>()
         var skippedAlreadyOffloaded = 0
         var skippedTooSmall = 0
+        // Error payloads from Android framework tools are intentionally terse.
+        // In a 16K context even a few hundred characters repeated across many
+        // turns matter, so use a lower cutoff than the large-model default.
+        val minContentChars = if (contextWindow < 32_000) 120 else 500
 
         for (msgIdx in 0 until candidateUpper) {
             val msg = agentHistory[msgIdx]
@@ -5653,7 +5660,7 @@ class ChatViewModel(
                             skippedAlreadyOffloaded++
                             continue
                         }
-                        val hasLargeContent = part.content.length > 500
+                        val hasLargeContent = part.content.length > minContentChars
                         val hasLargeImage = (part.imageData?.size ?: 0) > 1024
                         if (!hasLargeContent && !hasLargeImage) {
                             skippedTooSmall++
@@ -5705,7 +5712,7 @@ class ChatViewModel(
 
             val newPart: AgentContentPart? = when (part) {
                 is AgentContentPart.ToolResult -> {
-                    if (part.content.length > 500) {
+                    if (part.content.length > minContentChars) {
                         linuxPath = ContextOffload.offloadContent(
                             context, sid, part.content,
                             toolId = part.id, toolName = part.name,
@@ -5775,6 +5782,7 @@ class ChatViewModel(
             AppLogger.info(TAG, "  After:  $currentTokens/$contextWindow ($afterPct%)")
             AppLogger.info(TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         }
+        return offloadedCount
     }
 
     private suspend fun runAgentLoop(
@@ -5784,6 +5792,11 @@ class ChatViewModel(
         fallbackStrategy: com.openminis.app.data.model.FallbackStrategy = com.openminis.app.data.model.FallbackStrategy.default,
     ) {
         AppLogger.info(TAG_STREAM, "runAgentLoop ENTER provider=${provider.javaClass.simpleName} historySize=${agentHistory.size}")
+        // Loop protection is scoped to one user-driven agent run. A fresh
+        // continuation such as "authorized" must be allowed to retry after the
+        // user changed Android permission state, while repeats inside this run
+        // are still detected and blocked.
+        toolLoopDetector.reset()
         // [T-android-queued-message-interrupt-on-toolclose] `assistantId` is
         // normally a single message id for the whole agent loop (iOS-parity:
         // multiple tool/text turns folded into one bubble). It is reassigned
@@ -5891,6 +5904,7 @@ class ChatViewModel(
         var didInjectEmptyToolReminder = false
         var shellInfrastructureFailures = 0
         var stopAfterInfrastructureFailure: String? = null
+        var stopAfterLoopBlock: String? = null
         for (turn in 0 until MAX_AGENT_TURNS) {
             // Sanitize history before each API call (mirrors iOS pre-API validation)
             sanitizeAgentHistory()
@@ -6011,6 +6025,7 @@ class ChatViewModel(
             // so we catch at collect level and unwrap.
             var collectDone = false
             var retryAttempt = 0  // per-turn auto-retry counter (resets on each new turn)
+            var didRecoverContextOverflow = false
             while (!collectDone) {
                 try {
                     // [T-android-enhanced-cache] Stamp the per-turn Enhanced
@@ -6378,6 +6393,56 @@ class ChatViewModel(
                 } catch (e: Exception) {
                     if (e is CancellationException && e.cause == null) throw e  // real job cancellation
                     val actual = unwrapFlowException(e)
+                    val isContextOverflow =
+                        actual is com.openminis.app.data.model.LLMError.ProviderError &&
+                            ContextPolicy.isProviderContextOverflow(actual.detail)
+                    if (isContextOverflow && !didRecoverContextOverflow) {
+                        val window = effectiveContextWindowTokens()
+                        val offloaded = if (window != null && window > 0) {
+                            offloadContextIfNeeded(
+                                contextWindow = window,
+                                lastContextTokens = lastContextTokens,
+                                force = true,
+                            )
+                        } else {
+                            0
+                        }
+                        if (offloaded > 0) {
+                            didRecoverContextOverflow = true
+                            // The previous usage baseline described the
+                            // pre-offload prompt. Re-estimate the rewritten
+                            // history on the retry and accept fresh usage later.
+                            lastContextTokens = 0
+                            sanitizeAgentHistory()
+                            AppLogger.warning(
+                                TAG_STREAM,
+                                "Context overflow recovered by offloading $offloaded older tool result(s); retrying once",
+                            )
+                            if (allToolBlocks.size > turnStartBlockIndex) {
+                                while (allToolBlocks.size > turnStartBlockIndex) {
+                                    allToolBlocks.removeAt(allToolBlocks.size - 1)
+                                }
+                            }
+                            turnTextSb.setLength(0)
+                            currentTextBlockSb = null
+                            turnTextBlockIdx = -1
+                            turnThinking.clear()
+                            toolCalls.clear()
+                            dedupeStartCounts.clear()
+                            dedupeCompleteCounts.clear()
+                            inFlightRenamedId.clear()
+                            pendingChunkSb.setLength(0)
+                            lastUiUpdateMs = 0L
+                            lastFlushedLen = 0
+                            lastFileToolInputMs = 0L
+                            lastOtherToolInputMs = 0L
+                            withContext(Dispatchers.Main) {
+                                clearInlineError()
+                                updateAssistantMessage(assistantId, accumulatedText, true, allToolBlocks)
+                            }
+                            continue
+                        }
+                    }
                     val isRateLimit = actual is com.openminis.app.data.model.LLMError.RateLimited
                     val is5xx = actual is com.openminis.app.data.model.LLMError.ProviderError &&
                         actual.detail.contains(Regex("[5][0-9]{2}"))
@@ -6752,6 +6817,14 @@ class ChatViewModel(
                 }
                 val argsStr = args.toString()
                 val paramsMap = parseToolParams(argsStr)
+                val androidIntent = currentAndroidReadOnlyIntent()
+                val loopIdentity = AndroidNativeTool.canonicalLoopIdentity(
+                    toolName = name,
+                    argsJson = argsStr,
+                    userIntent = androidIntent,
+                )
+                val loopToolName = loopIdentity?.toolName ?: name
+                val loopParams = loopIdentity?.params ?: paramsMap
                 // Flip PENDING → RUNNING right before the execute dispatch so the UI
                 // (tool pill spinner) shows the exact moment execution begins.
                 val preIdx = allToolBlocks.indexOfFirst { it.id == id }
@@ -6765,7 +6838,7 @@ class ChatViewModel(
                 // Loop-detector check BEFORE execution. CRITICAL outcomes short-circuit
                 // the call: synthesize an error result so the tool_use/tool_result pair
                 // stays balanced and the LLM sees the block reason.
-                val precheck = toolLoopDetector.check(name, paramsMap)
+                val precheck = toolLoopDetector.check(loopToolName, loopParams)
                 if (precheck.level == Level.CRITICAL) {
                     val blockedMsg = precheck.message ?: "[LOOP BLOCKED] tool execution blocked"
                     android.util.Log.w("ToolChain[VM]",
@@ -6783,8 +6856,15 @@ class ChatViewModel(
                     }
                     // Record the blocked attempt so consecutive blocks still
                     // count toward the unknown-tool / circuit-breaker windows.
-                    toolLoopDetector.record(name, paramsMap,
+                    toolLoopDetector.record(loopToolName, loopParams,
                         result = null, errorMessage = blockedMsg, toolCallId = id)
+                    stopAfterLoopBlock = if (loopToolName == AndroidNativeTool.NAME) {
+                        "Repeated Android action was stopped after identical failures. " +
+                            "Review the Android permission/capability error instead of retrying it."
+                    } else {
+                        "Repeated tool action was stopped after identical failures. " +
+                            "Review the last tool error instead of retrying it."
+                    }
                     resultParts.add(AgentContentPart.ToolResult(
                         id = id, name = name,
                         content = blockedMsg,
@@ -6831,7 +6911,7 @@ class ChatViewModel(
                         )
                     }
                     toolLoopDetector.record(
-                        toolName = name, params = paramsMap,
+                        toolName = loopToolName, params = loopParams,
                         result = null, errorMessage = modelMessage, toolCallId = id
                     )
                     resultParts.add(AgentContentPart.ToolResult(
@@ -6866,8 +6946,8 @@ class ChatViewModel(
                 // CRITICAL only fires from check() and we already returned above.
                 val errMsgForDetector = if (!result.success) result.output else null
                 val postRecord = toolLoopDetector.record(
-                    toolName = name,
-                    params = paramsMap,
+                    toolName = loopToolName,
+                    params = loopParams,
                     result = if (result.success) result.output else null,
                     errorMessage = errMsgForDetector,
                     toolCallId = id,
@@ -6991,6 +7071,17 @@ class ChatViewModel(
                 withContext(Dispatchers.Main) {
                     updateAssistantMessage(assistantId, accumulatedText, false, allToolBlocks)
                     setInlineError(infrastructureStopMessage)
+                }
+                loopExitedNormally = true
+                break
+            }
+
+            val loopStopMessage = stopAfterLoopBlock
+            if (loopStopMessage != null) {
+                AppLogger.warning(TAG_STREAM, "Stopping agent loop after repeated Android no-progress result")
+                withContext(Dispatchers.Main) {
+                    updateAssistantMessage(assistantId, accumulatedText, false, allToolBlocks)
+                    setInlineError(loopStopMessage)
                 }
                 loopExitedNormally = true
                 break
@@ -7132,6 +7223,15 @@ class ChatViewModel(
         tools: List<AgentToolDefinition>,
     ): String? = preflightValidateToolCallImpl(name, args, tools)
 
+    private fun currentAndroidReadOnlyIntent(): String? =
+        AndroidNativeTool.resolveContinuationIntent(
+            agentHistory.asReversed()
+                .asSequence()
+                .filter { it.role == LLMMessage.Role.USER && it.content.isNotBlank() }
+                .map { it.content }
+                .toList(),
+        )
+
     private suspend fun executeTool(
         name: String,
         argsJson: String,
@@ -7181,9 +7281,7 @@ class ChatViewModel(
             AndroidNativeTool.NAME -> AndroidNativeTool.execute(
                 argsJson = argsJson,
                 sessionId = activeSessionId,
-                userIntent = agentHistory.lastOrNull {
-                    it.role == LLMMessage.Role.USER && it.content.isNotBlank()
-                }?.content,
+                userIntent = currentAndroidReadOnlyIntent(),
             )
             "shell_execute" -> executeShellCommand(argsJson, toolId, toolBlocks, assistantId, currentText)
             "browser_use" -> executeBrowserUseTool(argsJson)
@@ -7293,9 +7391,7 @@ class ChatViewModel(
                 commandLine = command,
                 sessionId = dispatchSessionId,
                 toolTitle = toolTitle,
-                userIntent = agentHistory.lastOrNull {
-                    it.role == LLMMessage.Role.USER && it.content.isNotBlank()
-                }?.content,
+                userIntent = currentAndroidReadOnlyIntent(),
             )?.let { return it }
 
             // [diag] sessionId vs realSessionId mismatch was the root cause
@@ -8116,7 +8212,7 @@ The `android_native` structured tool gives direct access to Android framework ca
 - android-speak — device TTS (`<text> [--rate F] [--pitch F] [--volume F]`; `--stop | --status`).
 - android-speech — microphone transcription (`listen [--language BCP47] [--max N] [--timeout SEC]`; `status`). Requires RECORD_AUDIO.
 - android-weather <latitude> <longitude> — Open-Meteo forecast (current + hourly + daily). No API key needed.
-- android-wifi — the phone's real Android Wi-Fi interface: `status`, `scan [--timeout N] [--max N]`, privileged `enable|disable|saved|connect|forget`. Use this instead of Linux desktop tools such as nmcli/iw, which cannot see Android radios from inside PRoot. Scan may trigger Android's location permission; configuration requires Shizuku/AXManager.
+- android-wifi — the phone's real Android Wi-Fi interface: `status`, `scan [--timeout N] [--max N]`, privileged `enable|disable|saved|connect|forget`. Use this instead of Linux desktop tools such as nmcli/iw, which cannot see Android radios from inside PRoot. A Wi-Fi scan uses Android WifiManager and location permission; it never needs Shizuku/root, package installation, WPA-status polling, or a shell command. Configuration requires Shizuku/AXManager.
 - android-bluetooth — the phone's real Classic Bluetooth and BLE interface: `status`, `paired`, `scan [--mode classic|ble|both] [--timeout N]`, `pair --address MAC`, privileged `enable|disable`. Pairing and runtime permission dialogs are Android-controlled.
 - android-hardware — hardware inventory and data: `all|sensors|sensor-sample|usb|nfc|network|cameras`. For an arbitrary privileged system interface use android-shizuku-cli; for unrestricted uid-0 shell use android-root-cli.
 - android-root-cli — unrestricted shell on devices that already provide root: `status`, `exec [--backend auto|shizuku|su] [--timeout-ms N] <command...>`. It uses uid-0 Shizuku/AXManager or existing su and does not root/exploit the device. Do not substitute this for android-wifi/android-bluetooth when a structured native command exists.
