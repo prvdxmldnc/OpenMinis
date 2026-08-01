@@ -55,6 +55,16 @@ object DebugMethodRegistry {
             example = ex("args" to JSONArray().apply { put("exec"); put("id") }),
         ),
         MethodSpec(
+            name = "debug.termux.exec",
+            description = "DEBUG-only: invoke TermuxOffloadHandler directly for end-to-end RUN_COMMAND and NetHunter verification.",
+            params = listOf(
+                ParamSpec("args", "[string]", required = false, description = "argv past `android-termux-cli` (e.g. [\"status\"] or [\"nethunter\",\"id\"])."),
+                ParamSpec("command", "string", required = false, description = "Whitespace-separated alternative to args."),
+            ),
+            returns = "{exitCode, output, argv}",
+            example = ex("args" to JSONArray().apply { put("status") }),
+        ),
+        MethodSpec(
             name = "debug.modelUse.exec",
             description = "DEBUG-only: invoke ModelUseOffloadHandler directly with the given argv. Parallels debug.shizuku.exec — lets harnesses trigger `minis-model-use run/list/search` without an in-shell prompt.",
             params = listOf(

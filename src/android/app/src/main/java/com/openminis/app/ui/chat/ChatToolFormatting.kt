@@ -51,6 +51,7 @@ internal fun formatStepDuration(seconds: Long, stillRunning: Boolean): String {
 
 // Helper: tool accent color
 internal fun toolAccentColor(toolName: String): Color = when (toolName) {
+    "android_native" -> Color(0xFF30B0C7)
     "shell_execute" -> Color(0xFF34C759)
     "file_read" -> Color(0xFF32ADE6)
     "file_write" -> Color(0xFF007AFF)
@@ -64,6 +65,7 @@ internal fun toolAccentColor(toolName: String): Color = when (toolName) {
 
 // Helper: tool icon (iOS: distinct SF Symbols per tool type)
 internal fun toolIconFor(toolName: String) = when (toolName) {
+    "android_native" -> Icons.Default.Build
     "shell_execute" -> Icons.Default.Terminal
     "file_read" -> Icons.Default.Description         // iOS: doc.text
     "file_write" -> Icons.AutoMirrored.Filled.NoteAdd   // iOS: doc.text.fill (filled variant)
@@ -77,6 +79,7 @@ internal fun toolIconFor(toolName: String) = when (toolName) {
 
 // Helper: tool display name for "Minis is using X"
 internal fun toolDisplayName(toolName: String): String = when (toolName) {
+    "android_native" -> "Android"
     "shell_execute" -> "terminal"
     "file_read" -> "file reader"
     "file_write" -> "file writer"
@@ -94,6 +97,7 @@ internal fun toolDisplayName(toolName: String): String = when (toolName) {
  * Mirrors iOS ToolLiveSheet.toolTitle so the wording matches per tool.
  */
 internal fun toolTitleLabel(toolName: String): String = when (toolName) {
+    "android_native" -> "Minis is using Android"
     "shell_execute" -> "Minis is using Shell"
     "file_read" -> "Minis is reading File"
     "file_write" -> "Minis is using Editor"

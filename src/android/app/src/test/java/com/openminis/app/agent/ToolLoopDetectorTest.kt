@@ -236,6 +236,42 @@ class ToolLoopDetectorTest {
         assertEquals(Level.WARNING, pre.level)
     }
 
+    @Test
+    fun `android no-progress loop blocks before a fourth identical action`() {
+        val detector = ToolLoopDetector()
+        val params = mapOf(
+            "command" to "android-wifi",
+            "arguments" to listOf("scan", "--max", "100"),
+        )
+        repeat(3) {
+            val pre = detector.check("android_native", params)
+            assertEquals(Level.NONE, pre.level)
+            detector.record(
+                "android_native",
+                params,
+                result = null,
+                errorMessage = "permission_denied: location permission required",
+            )
+        }
+
+        val blocked = detector.check("android_native", params)
+        assertEquals(Level.CRITICAL, blocked.level)
+        assertTrue(blocked.message?.contains("Android action") == true)
+    }
+
+    @Test
+    fun `android no-progress streak resets after changed result`() {
+        val detector = ToolLoopDetector()
+        val params = mapOf("command" to "android-wifi", "arguments" to listOf("scan"))
+        repeat(3) {
+            detector.record("android_native", params, null, "permission_denied")
+        }
+        detector.record("android_native", params, "{\"networks\":[]}", null)
+
+        val pre = detector.check("android_native", params)
+        assertEquals(Level.NONE, pre.level)
+    }
+
     // ─── 4. global_circuit_breaker ───────────────────────────────────────────
 
     @Test
@@ -297,6 +333,11 @@ class ToolLoopDetectorTest {
     @Test(expected = IllegalArgumentException::class)
     fun `config rejects critical gte breaker`() {
         ToolLoopConfig(criticalThreshold = 30, globalCircuitBreakerThreshold = 30)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun `config rejects non-positive Android threshold`() {
+        ToolLoopConfig(androidNoProgressCriticalThreshold = 0)
     }
 
 }

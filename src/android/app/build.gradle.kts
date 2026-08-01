@@ -36,8 +36,8 @@ android {
         applicationId = "com.openminis.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 20
-        versionName = "0.20-preview"
+        versionCode = 24
+        versionName = "0.20-research.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -126,9 +126,48 @@ val copyBashismRules by tasks.registering(Copy::class) {
     }
     into(layout.projectDirectory.dir("src/main/assets/bashism"))
 }
+
+// The app can compile without the generated Alpine/PRoot artifacts, but that
+// produces an APK whose first shell command fails at runtime. Make an
+// incomplete research build impossible: both the Linux rootfs and the exact
+// PRoot executable location used by RootfsManager must exist before preBuild.
+val verifySandboxAssets by tasks.registering {
+    val assetsDir = layout.projectDirectory.dir("src/main/assets")
+    val jniDir = layout.projectDirectory.dir("src/main/jniLibs/arm64-v8a")
+    val rootfsGzip = assetsDir.file("alpine-minirootfs.tar.gz")
+    val rootfsTar = assetsDir.file("alpine-minirootfs.tar")
+    val prootAsset = assetsDir.file("proot-aarch64")
+    val prootNative = jniDir.file("libproot.so")
+
+    inputs.files(rootfsGzip, rootfsTar, prootAsset, prootNative)
+    doLast {
+        val rootfs = listOf(rootfsGzip.asFile, rootfsTar.asFile)
+            .firstOrNull { it.isFile && it.length() >= 2_000_000L }
+            ?: throw GradleException(
+                "Android sandbox rootfs is missing or incomplete. Run " +
+                    "./scripts/prepare_android_sandbox.sh before building."
+            )
+        val required = listOf(
+            prootAsset.asFile to "assets/proot-aarch64",
+            prootNative.asFile to "jniLibs/arm64-v8a/libproot.so",
+        )
+        required.forEach { (file, label) ->
+            if (!file.isFile || file.length() < 100_000L) {
+                throw GradleException(
+                    "Android sandbox PRoot artifact '$label' is missing or " +
+                        "incomplete. Run ./deps/build_proot.sh before building."
+                )
+            }
+        }
+        logger.lifecycle(
+            "Verified Android sandbox: ${rootfs.name} (${rootfs.length()} bytes), " +
+                "PRoot ${prootNative.asFile.length()} bytes"
+        )
+    }
+}
 tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }
     .configureEach { dependsOn(copyBashismRules) }
-tasks.named("preBuild") { dependsOn(copyBashismRules) }
+tasks.named("preBuild") { dependsOn(copyBashismRules, verifySandboxAssets) }
 
 // [T-android-debugserver-skill] Stage the debug-server skill + an Android
 // reference client into the DEBUG-ONLY asset source set, so the debug server
@@ -141,8 +180,11 @@ tasks.named("preBuild") { dependsOn(copyBashismRules) }
 val stageDebugSkillAssets by tasks.registering(Exec::class) {
     val script = rootProject.file("../../scripts/gen_debug_skill_android.sh")
     val skillDir = rootProject.file("../../.claude/skills/debug-server")
-    onlyIf { script.exists() }
-    inputs.dir(skillDir).optional()
+    // The public mirror does not always include the internal .claude skill
+    // source. Skip staging when either input is absent instead of failing
+    // Gradle validation before `onlyIf` can make the debug asset optional.
+    onlyIf { script.exists() && skillDir.isDirectory }
+    if (skillDir.isDirectory) inputs.dir(skillDir)
     inputs.file(script).optional()
     outputs.dir(layout.projectDirectory.dir("src/debug/assets/debug-skill"))
     commandLine("bash", script.absolutePath)

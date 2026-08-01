@@ -78,16 +78,23 @@ data class AgentToolParam(
     val type: String,
     val description: String,
     val enumValues: List<String>? = null,
+    val itemsType: String? = null,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("type", type)
         put("description", description)
         if (enumValues != null) put("enum", JSONArray(enumValues))
+        if (itemsType != null) {
+            put("items", JSONObject().put("type", itemsType))
+        }
     }
 
     fun toGeminiJson(): JSONObject = JSONObject().apply {
         put("type", type.uppercase())
         put("description", description)
         if (enumValues != null) put("enum", JSONArray(enumValues))
+        if (itemsType != null) {
+            put("items", JSONObject().put("type", itemsType.uppercase()))
+        }
     }
 }

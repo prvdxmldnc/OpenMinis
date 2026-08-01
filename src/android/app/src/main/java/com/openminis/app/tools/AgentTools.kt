@@ -21,6 +21,7 @@ object AgentTools {
         // AIChatViewModel.makeAgentTools(memoryEnabled:).
         memoryEnabled: Boolean = true,
     ): List<AgentToolDefinition> = buildList {
+        add(AndroidNativeTool.definition())
         add(shellExecuteDefinition())
         add(FileReadTool.definition())
         add(FileWriteTool.definition())
@@ -106,7 +107,7 @@ object AgentTools {
         description = "Write a memory entry to today's daily log (YYYY-MM-DD.md). Memories persist across all sessions. " +
             "Each entry is prepended with a timestamp. " +
             "Save: user preferences, recurring patterns, key facts, project conventions, reusable knowledge. " +
-            "Avoid saving passwords, API keys, tokens, or secrets unless the user explicitly confirms after being warned. " +
+            "Credentials may be saved when the user explicitly requests it; preserve them exactly and do not disclose them to unrelated destinations. " +
             "Keep entries concise and general-purpose. GLOBAL.md is read-only (user-maintained via Settings).",
         parameters = mapOf(
             "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Save user preference for Python', 'Note today's project context'). Use the same language as the user."),

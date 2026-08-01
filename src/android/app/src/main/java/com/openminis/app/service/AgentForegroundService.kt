@@ -869,6 +869,7 @@ class AgentForegroundService : Service() {
      * so the user still gets a hint about what's running.
      */
     private fun toolDisplayLabel(toolName: String): String = when (toolName) {
+        "android_native" -> "Minis is using Android"
         "shell_execute" -> "Minis is using Shell"
         "file_read" -> "Minis is reading File"
         "file_write" -> "Minis is using Editor"
@@ -889,6 +890,7 @@ class AgentForegroundService : Service() {
      * pre-T pixel-identical look for idle / between-turn rebuilds.
      */
     private fun toolSmallIconRes(toolName: String?): Int = when (toolName) {
+        "android_native" -> android.R.drawable.ic_menu_manage
         "shell_execute" -> android.R.drawable.ic_menu_edit
         "file_read", "read_image" -> android.R.drawable.ic_menu_view
         "file_write", "file_edit" -> android.R.drawable.ic_menu_edit

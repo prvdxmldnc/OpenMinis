@@ -20,7 +20,7 @@ data class ContextPolicy(
     val offloadTarget: Int,
     /** Above this, trigger a compact/summarize pass. 0 disables. */
     val compactThreshold: Int,
-    /** When true, the tier is too small for auto-compact; only surface .exhausted. */
+    /** When true, auto-summary is disabled; offload may still protect the window. */
     val exhaustedOnly: Boolean,
     /** Whether the "Compact now" button is offered in the UI. */
     val manualCompactAllowed: Boolean,
@@ -52,18 +52,21 @@ data class ContextPolicy(
     companion object {
         /**
          * Produce the policy for a given context window size. Four tiers:
-         *   - `<32K`   → offload/compact disabled; UI tells user to start a new chat.
+         *   - `<32K`   → early tool-result offload; no automatic summarisation.
          *   - `32K–64K` → offload only; exhaust line = ctx − 10k.
          *   - `64K–128K` → offload + compact; headroom 10k for compact.
          *   - `≥128K`  → generous offload + compact; headroom 20k.
          */
         fun forContextWindow(contextWindow: Int): ContextPolicy = when {
             contextWindow < 32_000 -> ContextPolicy(
-                offloadThreshold = 0,
-                offloadTarget = 0,
+                // Local models need more reserve because the system prompt and
+                // tool schemas consume a meaningful, provider-specific share
+                // that is not always present in usage metadata.
+                offloadThreshold = contextWindow * 70 / 100,
+                offloadTarget = contextWindow * 55 / 100,
                 compactThreshold = 0,
                 exhaustedOnly = true,
-                manualCompactAllowed = false,
+                manualCompactAllowed = true,
             )
             contextWindow < 64_000 -> ContextPolicy(
                 offloadThreshold = contextWindow - 10_000,
@@ -86,6 +89,17 @@ data class ContextPolicy(
                 exhaustedOnly = false,
                 manualCompactAllowed = true,
             )
+        }
+
+        /** Strict enough not to confuse a bad max_tokens value with prompt overflow. */
+        fun isProviderContextOverflow(detail: String): Boolean {
+            val value = detail.lowercase()
+            return value.contains("exceeds the available context size") ||
+                value.contains("maximum context length") ||
+                value.contains("context_length_exceeded") ||
+                value.contains("prompt is too long") ||
+                value.contains("input is too long for the model") ||
+                (value.contains("context window") && value.contains("exceed"))
         }
     }
 }

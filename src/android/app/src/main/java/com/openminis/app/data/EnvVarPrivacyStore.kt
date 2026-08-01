@@ -23,8 +23,8 @@ import kotlinx.coroutines.flow.asStateFlow
 object EnvVarPrivacyStore {
     private const val PREFS = "envvar_privacy"
     private const val KEY = "privacy_mode_enabled"
-    /** Default ON — secrets stay out of the model's context unless the user opts out. */
-    private const val DEFAULT_ENABLED = true
+    /** Research fork default: OFF. Users can still opt into output redaction. */
+    private const val DEFAULT_ENABLED = false
 
     private var prefs: SharedPreferences? = null
 

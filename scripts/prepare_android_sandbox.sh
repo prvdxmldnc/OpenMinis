@@ -2,8 +2,7 @@
 #
 # Prepare Android sandbox assets:
 #   1. Download Alpine Linux aarch64 minirootfs
-#   2. Download PRoot aarch64 static binary from Termux packages
-#   3. Place both into src/android/app/src/main/assets/
+#   2. Verify the source-built PRoot artifacts used by the Android runtime
 #
 # Usage: ./scripts/prepare_android_sandbox.sh
 #
@@ -17,69 +16,63 @@ ASSETS_DIR="$PROJECT_ROOT/src/android/app/src/main/assets"
 ALPINE_VERSION="3.21"
 ALPINE_RELEASE="3.21.3"
 ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/releases/aarch64/alpine-minirootfs-${ALPINE_RELEASE}-aarch64.tar.gz"
-
-# Termux proot package — aarch64 static binary
-PROOT_VERSION="5.1.107-70"
-PROOT_DEB_URL="https://packages.termux.dev/apt/termux-main/pool/main/p/proot/proot_${PROOT_VERSION}_aarch64.deb"
+ALPINE_SHA256="ead8a4b37867bd19e7417dd078748e2312c0aea364403d96758d63ea8ff261ea"
 
 mkdir -p "$ASSETS_DIR"
 
 ROOTFS_FILE="$ASSETS_DIR/alpine-minirootfs.tar.gz"
 PROOT_FILE="$ASSETS_DIR/proot-aarch64"
+PROOT_JNI_FILE="$PROJECT_ROOT/src/android/app/src/main/jniLibs/arm64-v8a/libproot.so"
+
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
 
 # --- Alpine rootfs ---
 if [ -f "$ROOTFS_FILE" ]; then
     echo "✓ Alpine rootfs already exists: $ROOTFS_FILE"
 else
     echo "Downloading Alpine Linux ${ALPINE_RELEASE} aarch64 minirootfs..."
-    curl -fSL -o "$ROOTFS_FILE" "$ALPINE_URL"
+    ROOTFS_TMP="${ROOTFS_FILE}.download"
+    rm -f "$ROOTFS_TMP"
+    curl -fSL -o "$ROOTFS_TMP" "$ALPINE_URL"
+    ACTUAL_SHA256="$(sha256_file "$ROOTFS_TMP")"
+    if [ "$ACTUAL_SHA256" != "$ALPINE_SHA256" ]; then
+        rm -f "$ROOTFS_TMP"
+        echo "Error: Alpine rootfs SHA-256 mismatch" >&2
+        exit 1
+    fi
+    mv "$ROOTFS_TMP" "$ROOTFS_FILE"
     echo "✓ Downloaded: $ROOTFS_FILE ($(du -h "$ROOTFS_FILE" | cut -f1))"
 fi
 
-# --- PRoot binary ---
-if [ -f "$PROOT_FILE" ]; then
-    echo "✓ PRoot binary already exists: $PROOT_FILE"
-else
-    echo "Downloading PRoot ${PROOT_VERSION} aarch64 from Termux..."
-
-    TMPDIR="$(mktemp -d)"
-    trap 'rm -rf "$TMPDIR"' EXIT
-
-    DEB_FILE="$TMPDIR/proot.deb"
-    curl -fSL -o "$DEB_FILE" "$PROOT_DEB_URL"
-
-    # Extract .deb (it's an ar archive containing data.tar.xz)
-    cd "$TMPDIR"
-    ar x "$DEB_FILE"
-
-    # Extract data archive
-    if [ -f "data.tar.xz" ]; then
-        tar xf data.tar.xz
-    elif [ -f "data.tar.gz" ]; then
-        tar xzf data.tar.gz
-    elif [ -f "data.tar.zst" ]; then
-        zstd -d data.tar.zst -o data.tar
-        tar xf data.tar
-    else
-        echo "Error: Could not find data archive in .deb"
-        ls -la "$TMPDIR"
-        exit 1
-    fi
-
-    # Find the proot binary
-    PROOT_BIN=$(find "$TMPDIR" -name "proot" -type f | head -1)
-    if [ -z "$PROOT_BIN" ]; then
-        echo "Error: Could not find proot binary in extracted .deb"
-        find "$TMPDIR" -type f
-        exit 1
-    fi
-
-    cp "$PROOT_BIN" "$PROOT_FILE"
-    chmod +x "$PROOT_FILE"
-    cd "$PROJECT_ROOT"
-
-    echo "✓ Extracted PRoot binary: $PROOT_FILE ($(du -h "$PROOT_FILE" | cut -f1))"
+# Verify an existing rootfs too; a partial/corrupt cached download must never
+# silently enter an APK.
+ACTUAL_SHA256="$(sha256_file "$ROOTFS_FILE")"
+if [ "$ACTUAL_SHA256" != "$ALPINE_SHA256" ]; then
+    echo "Error: cached Alpine rootfs SHA-256 mismatch: $ROOTFS_FILE" >&2
+    exit 1
 fi
+
+# PRoot must come from the pinned OpenMinis fork build. A generic Termux .deb
+# does not populate nativeLibraryDir, which is the path RootfsManager executes.
+for required in "$PROOT_FILE" "$PROOT_JNI_FILE"; do
+    if [ ! -f "$required" ]; then
+        echo "Error: missing PRoot artifact: $required" >&2
+        echo "Run ./deps/build_proot.sh first (Android NDK r28+ required)." >&2
+        exit 1
+    fi
+done
+
+if ! cmp -s "$PROOT_FILE" "$PROOT_JNI_FILE"; then
+    echo "Error: PRoot asset and libproot.so differ; rebuild both together." >&2
+    exit 1
+fi
+echo "✓ Verified PRoot binary: $PROOT_FILE ($(du -h "$PROOT_FILE" | cut -f1))"
 
 echo ""
 echo "Assets ready in: $ASSETS_DIR"

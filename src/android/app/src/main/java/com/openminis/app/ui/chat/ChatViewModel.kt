@@ -51,6 +51,7 @@ import com.openminis.app.sandbox.ExecutionCoordinator
 import com.openminis.app.terminal.MinisOpenUrlBroker
 import com.openminis.app.terminal.MinisUrlMarker
 import com.openminis.app.tools.AgentTools
+import com.openminis.app.tools.AndroidNativeTool
 import com.openminis.app.tools.FileEditTool
 import com.openminis.app.tools.FileReadTool
 import com.openminis.app.tools.FileWriteTool
@@ -5526,6 +5527,10 @@ class ChatViewModel(
         var totalChars = 0
         var imageTokens = 0
         for (msg in agentHistory) {
+            // Plain user/assistant text normally lives in `content`, not in a
+            // Text contentPart. Omitting it made the fallback estimate badly
+            // under-count long local-model chats.
+            totalChars += msg.content.length
             for (part in msg.contentParts) {
                 when (part) {
                     is AgentContentPart.Text -> totalChars += part.text.length
@@ -5599,14 +5604,13 @@ class ChatViewModel(
         contextWindow: Int,
         lastContextTokens: Int,
         force: Boolean = false,
-    ) {
+    ): Int {
         val sid = activeSessionId
         val policy = ContextPolicy.forContextWindow(contextWindow)
 
         if (!force && policy.offloadThreshold == 0) {
-            // Small-window tier: offload disabled — UI surfaces "exhausted"
-            // when the user crosses the threshold. Nothing to do here.
-            return
+            // A custom/invalid policy may explicitly disable offload.
+            return 0
         }
 
         val effectiveTokens =
@@ -5615,7 +5619,7 @@ class ChatViewModel(
         if (!force && effectiveTokens < policy.offloadThreshold) {
             // Below threshold — no work needed. Caller logs at debug level
             // via dynamicMaxTokens; we stay silent to keep logs readable.
-            return
+            return 0
         }
 
         val targetTokens = if (force) 0 else policy.offloadTarget
@@ -5642,6 +5646,10 @@ class ChatViewModel(
         val candidates = mutableListOf<OffloadCandidate>()
         var skippedAlreadyOffloaded = 0
         var skippedTooSmall = 0
+        // Error payloads from Android framework tools are intentionally terse.
+        // In a 16K context even a few hundred characters repeated across many
+        // turns matter, so use a lower cutoff than the large-model default.
+        val minContentChars = if (contextWindow < 32_000) 120 else 500
 
         for (msgIdx in 0 until candidateUpper) {
             val msg = agentHistory[msgIdx]
@@ -5652,7 +5660,7 @@ class ChatViewModel(
                             skippedAlreadyOffloaded++
                             continue
                         }
-                        val hasLargeContent = part.content.length > 500
+                        val hasLargeContent = part.content.length > minContentChars
                         val hasLargeImage = (part.imageData?.size ?: 0) > 1024
                         if (!hasLargeContent && !hasLargeImage) {
                             skippedTooSmall++
@@ -5704,7 +5712,7 @@ class ChatViewModel(
 
             val newPart: AgentContentPart? = when (part) {
                 is AgentContentPart.ToolResult -> {
-                    if (part.content.length > 500) {
+                    if (part.content.length > minContentChars) {
                         linuxPath = ContextOffload.offloadContent(
                             context, sid, part.content,
                             toolId = part.id, toolName = part.name,
@@ -5774,6 +5782,7 @@ class ChatViewModel(
             AppLogger.info(TAG, "  After:  $currentTokens/$contextWindow ($afterPct%)")
             AppLogger.info(TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         }
+        return offloadedCount
     }
 
     private suspend fun runAgentLoop(
@@ -5783,6 +5792,11 @@ class ChatViewModel(
         fallbackStrategy: com.openminis.app.data.model.FallbackStrategy = com.openminis.app.data.model.FallbackStrategy.default,
     ) {
         AppLogger.info(TAG_STREAM, "runAgentLoop ENTER provider=${provider.javaClass.simpleName} historySize=${agentHistory.size}")
+        // Loop protection is scoped to one user-driven agent run. A fresh
+        // continuation such as "authorized" must be allowed to retry after the
+        // user changed Android permission state, while repeats inside this run
+        // are still detected and blocked.
+        toolLoopDetector.reset()
         // [T-android-queued-message-interrupt-on-toolclose] `assistantId` is
         // normally a single message id for the whole agent loop (iOS-parity:
         // multiple tool/text turns folded into one bubble). It is reassigned
@@ -5888,6 +5902,9 @@ class ChatViewModel(
         // we surface a real error instead of a silent blank bubble. Mirrors iOS
         // AIChatViewModel.didInjectEmptyToolReminderThisRun.
         var didInjectEmptyToolReminder = false
+        var shellInfrastructureFailures = 0
+        var stopAfterInfrastructureFailure: String? = null
+        var stopAfterLoopBlock: String? = null
         for (turn in 0 until MAX_AGENT_TURNS) {
             // Sanitize history before each API call (mirrors iOS pre-API validation)
             sanitizeAgentHistory()
@@ -6008,6 +6025,7 @@ class ChatViewModel(
             // so we catch at collect level and unwrap.
             var collectDone = false
             var retryAttempt = 0  // per-turn auto-retry counter (resets on each new turn)
+            var didRecoverContextOverflow = false
             while (!collectDone) {
                 try {
                     // [T-android-enhanced-cache] Stamp the per-turn Enhanced
@@ -6375,6 +6393,56 @@ class ChatViewModel(
                 } catch (e: Exception) {
                     if (e is CancellationException && e.cause == null) throw e  // real job cancellation
                     val actual = unwrapFlowException(e)
+                    val isContextOverflow =
+                        actual is com.openminis.app.data.model.LLMError.ProviderError &&
+                            ContextPolicy.isProviderContextOverflow(actual.detail)
+                    if (isContextOverflow && !didRecoverContextOverflow) {
+                        val window = effectiveContextWindowTokens()
+                        val offloaded = if (window != null && window > 0) {
+                            offloadContextIfNeeded(
+                                contextWindow = window,
+                                lastContextTokens = lastContextTokens,
+                                force = true,
+                            )
+                        } else {
+                            0
+                        }
+                        if (offloaded > 0) {
+                            didRecoverContextOverflow = true
+                            // The previous usage baseline described the
+                            // pre-offload prompt. Re-estimate the rewritten
+                            // history on the retry and accept fresh usage later.
+                            lastContextTokens = 0
+                            sanitizeAgentHistory()
+                            AppLogger.warning(
+                                TAG_STREAM,
+                                "Context overflow recovered by offloading $offloaded older tool result(s); retrying once",
+                            )
+                            if (allToolBlocks.size > turnStartBlockIndex) {
+                                while (allToolBlocks.size > turnStartBlockIndex) {
+                                    allToolBlocks.removeAt(allToolBlocks.size - 1)
+                                }
+                            }
+                            turnTextSb.setLength(0)
+                            currentTextBlockSb = null
+                            turnTextBlockIdx = -1
+                            turnThinking.clear()
+                            toolCalls.clear()
+                            dedupeStartCounts.clear()
+                            dedupeCompleteCounts.clear()
+                            inFlightRenamedId.clear()
+                            pendingChunkSb.setLength(0)
+                            lastUiUpdateMs = 0L
+                            lastFlushedLen = 0
+                            lastFileToolInputMs = 0L
+                            lastOtherToolInputMs = 0L
+                            withContext(Dispatchers.Main) {
+                                clearInlineError()
+                                updateAssistantMessage(assistantId, accumulatedText, true, allToolBlocks)
+                            }
+                            continue
+                        }
+                    }
                     val isRateLimit = actual is com.openminis.app.data.model.LLMError.RateLimited
                     val is5xx = actual is com.openminis.app.data.model.LLMError.ProviderError &&
                         actual.detail.contains(Regex("[5][0-9]{2}"))
@@ -6749,6 +6817,14 @@ class ChatViewModel(
                 }
                 val argsStr = args.toString()
                 val paramsMap = parseToolParams(argsStr)
+                val androidIntent = currentAndroidReadOnlyIntent()
+                val loopIdentity = AndroidNativeTool.canonicalLoopIdentity(
+                    toolName = name,
+                    argsJson = argsStr,
+                    userIntent = androidIntent,
+                )
+                val loopToolName = loopIdentity?.toolName ?: name
+                val loopParams = loopIdentity?.params ?: paramsMap
                 // Flip PENDING → RUNNING right before the execute dispatch so the UI
                 // (tool pill spinner) shows the exact moment execution begins.
                 val preIdx = allToolBlocks.indexOfFirst { it.id == id }
@@ -6762,7 +6838,7 @@ class ChatViewModel(
                 // Loop-detector check BEFORE execution. CRITICAL outcomes short-circuit
                 // the call: synthesize an error result so the tool_use/tool_result pair
                 // stays balanced and the LLM sees the block reason.
-                val precheck = toolLoopDetector.check(name, paramsMap)
+                val precheck = toolLoopDetector.check(loopToolName, loopParams)
                 if (precheck.level == Level.CRITICAL) {
                     val blockedMsg = precheck.message ?: "[LOOP BLOCKED] tool execution blocked"
                     android.util.Log.w("ToolChain[VM]",
@@ -6780,8 +6856,15 @@ class ChatViewModel(
                     }
                     // Record the blocked attempt so consecutive blocks still
                     // count toward the unknown-tool / circuit-breaker windows.
-                    toolLoopDetector.record(name, paramsMap,
+                    toolLoopDetector.record(loopToolName, loopParams,
                         result = null, errorMessage = blockedMsg, toolCallId = id)
+                    stopAfterLoopBlock = if (loopToolName == AndroidNativeTool.NAME) {
+                        "Repeated Android action was stopped after identical failures. " +
+                            "Review the Android permission/capability error instead of retrying it."
+                    } else {
+                        "Repeated tool action was stopped after identical failures. " +
+                            "Review the last tool error instead of retrying it."
+                    }
                     resultParts.add(AgentContentPart.ToolResult(
                         id = id, name = name,
                         content = blockedMsg,
@@ -6828,7 +6911,7 @@ class ChatViewModel(
                         )
                     }
                     toolLoopDetector.record(
-                        toolName = name, params = paramsMap,
+                        toolName = loopToolName, params = loopParams,
                         result = null, errorMessage = modelMessage, toolCallId = id
                     )
                     resultParts.add(AgentContentPart.ToolResult(
@@ -6846,23 +6929,43 @@ class ChatViewModel(
                 val result = executeTool(name, argsStr, id, allToolBlocks, assistantId, accumulatedText)
                 android.util.Log.d("ToolChain[VM]", "[turn=$turn] executeTool END name=$name success=${result.success} title=${result.toolTitle} outputLen=${result.output.length} output=${result.output.take(200)}")
 
+                val shellInfrastructureFailure = name == "shell_execute" &&
+                    !result.success && AndroidNativeTool.isShellInfrastructureFailure(result.output)
+                if (shellInfrastructureFailure) {
+                    shellInfrastructureFailures += 1
+                    if (shellInfrastructureFailures >= 2) {
+                        stopAfterInfrastructureFailure =
+                            "Shell failed to start twice. The agent loop was stopped to prevent repeated package installs."
+                    }
+                } else if (name == "shell_execute" && result.success) {
+                    shellInfrastructureFailures = 0
+                }
+
                 // Record post-execution. WARNING text is appended to the tool
                 // result so the model sees it on its next turn. No block here —
                 // CRITICAL only fires from check() and we already returned above.
                 val errMsgForDetector = if (!result.success) result.output else null
                 val postRecord = toolLoopDetector.record(
-                    toolName = name,
-                    params = paramsMap,
+                    toolName = loopToolName,
+                    params = loopParams,
                     result = if (result.success) result.output else null,
                     errorMessage = errMsgForDetector,
                     toolCallId = id,
                 )
+                val baseOutputForLLM = if (shellInfrastructureFailure) {
+                    result.output +
+                        "\n\n<system-reminder>Shell infrastructure is unavailable. Do not retry " +
+                        "shell_execute or vary package-install commands. Use android_native for " +
+                        "phone capabilities, otherwise report the failure.</system-reminder>"
+                } else {
+                    result.output
+                }
                 val outputForLLM = if (postRecord.level == Level.WARNING && postRecord.message != null) {
                     AppLogger.debug("ChatViewModel",
                         "appending loop-warning to tool result name=$name key=${postRecord.warningKey}")
-                    "${result.output}\n\n${postRecord.message}"
+                    "$baseOutputForLLM\n\n${postRecord.message}"
                 } else {
-                    result.output
+                    baseOutputForLLM
                 }
 
                 val blockIdx = allToolBlocks.indexOfFirst { it.id == id }
@@ -6961,6 +7064,28 @@ class ChatViewModel(
                 contentParts = resultParts,
                 dbMessageId = toolResultDbId,
             ))
+
+            val infrastructureStopMessage = stopAfterInfrastructureFailure
+            if (infrastructureStopMessage != null) {
+                AppLogger.warning(TAG_STREAM, "Stopping agent loop after repeated shell startup failure")
+                withContext(Dispatchers.Main) {
+                    updateAssistantMessage(assistantId, accumulatedText, false, allToolBlocks)
+                    setInlineError(infrastructureStopMessage)
+                }
+                loopExitedNormally = true
+                break
+            }
+
+            val loopStopMessage = stopAfterLoopBlock
+            if (loopStopMessage != null) {
+                AppLogger.warning(TAG_STREAM, "Stopping agent loop after repeated Android no-progress result")
+                withContext(Dispatchers.Main) {
+                    updateAssistantMessage(assistantId, accumulatedText, false, allToolBlocks)
+                    setInlineError(loopStopMessage)
+                }
+                loopExitedNormally = true
+                break
+            }
 
             // Auto-title after first exchange (mirrors iOS generateSessionTitleIfNeeded)
             if (turn == 0) {
@@ -7098,6 +7223,15 @@ class ChatViewModel(
         tools: List<AgentToolDefinition>,
     ): String? = preflightValidateToolCallImpl(name, args, tools)
 
+    private fun currentAndroidReadOnlyIntent(): String? =
+        AndroidNativeTool.resolveContinuationIntent(
+            agentHistory.asReversed()
+                .asSequence()
+                .filter { it.role == LLMMessage.Role.USER && it.content.isNotBlank() }
+                .map { it.content }
+                .toList(),
+        )
+
     private suspend fun executeTool(
         name: String,
         argsJson: String,
@@ -7144,6 +7278,11 @@ class ChatViewModel(
             // bindMounts map and would surface another session's
             // /var/minis/{workspace,attachments,offloads,browser} files.
             ReadImageTool.NAME -> ReadImageTool.execute(argsJson, activeSessionId, context)
+            AndroidNativeTool.NAME -> AndroidNativeTool.execute(
+                argsJson = argsJson,
+                sessionId = activeSessionId,
+                userIntent = currentAndroidReadOnlyIntent(),
+            )
             "shell_execute" -> executeShellCommand(argsJson, toolId, toolBlocks, assistantId, currentText)
             "browser_use" -> executeBrowserUseTool(argsJson)
             "memory_write" -> executeMemoryWriteTool(argsJson)
@@ -7243,11 +7382,22 @@ class ChatViewModel(
                 }
             }
 
+            // A simple android-* CLI does not need Alpine or PRoot. Dispatch it
+            // straight to the same host-side handler used by android_native.
+            // Shell pipelines/expansions deliberately remain on the real shell
+            // path so this shortcut never changes their semantics.
+            val dispatchSessionId = activeSessionId
+            AndroidNativeTool.executeSimpleShellCommandIfSupported(
+                commandLine = command,
+                sessionId = dispatchSessionId,
+                toolTitle = toolTitle,
+                userIntent = currentAndroidReadOnlyIntent(),
+            )?.let { return it }
+
             // [diag] sessionId vs realSessionId mismatch was the root cause
             // of the Chinese-emoji filename "disappears" bug. `activeSessionId`
             // resolves to the persisted id once `ensureSession()` has run, so
             // every shell runs in a directory that survives VM recreation.
-            val dispatchSessionId = activeSessionId
             android.util.Log.w("ShellExecDiag",
                 "executeShell dispatch=$dispatchSessionId rawSessionId=$sessionId realSessionId=$realSessionId isDraft=$isDraft cmd=${command.take(120).replace('\n', ' ')}")
 
@@ -7976,7 +8126,7 @@ Memory system (currently ENABLED):
 - Use memory_get to recall past knowledge before starting tasks — check if there are relevant memories that can help.
 - Proactively save memories (via memory_write to daily log) when you discover user preferences or important patterns — don't wait to be asked.
 - When the user says 'remember this' or similar, use memory_write to persist to the daily log. Only write to GLOBAL.md if the user specifically asks for global/persistent storage.
-- What NOT to remember: passwords, API keys, tokens, secrets, or any sensitive credentials. Warn the user about the risk first; only proceed if they explicitly confirm.
+- Credentials and other sensitive values may be remembered when the user explicitly asks. Preserve them exactly and do not invent, alter, or disclose them to an unrelated destination.
 - Keep memories concise, factual, and general-purpose — avoid noise that won't be useful later."""
         } else {
             """
@@ -7989,6 +8139,7 @@ Memory system (currently DISABLED):
         val base = identitySection + """You should proactively use shell commands to accomplish the user's tasks — installing packages (apk add), writing and running scripts, managing files, networking, and any other operations a Linux terminal can perform.
 
 Available tools:
+- android_native: Directly invoke Android framework, radio, hardware, Accessibility, Shizuku, or existing-root capabilities. For anything involving the phone itself, prefer this structured tool over shell_execute. It does not require the Alpine/PRoot sandbox.
 - shell_execute: Run any shell command. Each invocation is an isolated process with stdout/stderr captured. Prefer this for most tasks — it is a real Linux environment with persistent filesystem. Common tools (python3, pip, curl, wget, git, ssh, etc.) can be installed via apk add; Python packages via pip install. Use `which <cmd>` to check if a tool is already installed before running apk add — many packages persist across sessions. When you need to wait before checking results (e.g. polling, waiting for a process), use the `delay` parameter instead of `sleep` in the command — delay blocks the agent flow without occupying the shell, so other concurrent tasks can use it during the wait. This avoids resource contention. Execution discipline for long-running or dispatched work: make tool calls immediately instead of describing intentions, and keep working until the task is complete. Without a scheduler or timed-callback tool, `delay` is your ONLY wait mechanism within a turn — to follow up on something still running, chain delay-then-check calls at a task-appropriate interval until you have the result or hit a sensible retry cap. NEVER end a turn with a promise of future action: 'I'll keep monitoring', 'will sync the result later', and ending right after a single still-running status check with 'let's keep waiting' are all the same violation — once your turn ends, NOTHING runs until the user's next message. If polling to completion is genuinely not worth blocking the turn, close honestly instead: state that the task keeps running in the background, that you will only learn its outcome when the user next messages (or they ask you to check), and — if something must fire on a schedule beyond this conversation — point them to the options under 'Scheduled tasks' later in this prompt (native alarm reminder or a system-level schedule; those notify the USER, they do not wake you).
 - file_read: Read file contents (faster than cat).
 - file_write: Create new files or overwrite existing files (faster than echo/tee).
@@ -8047,7 +8198,7 @@ Tone and style:
 - Be concise. Prefer action over explanation — when the user asks for something that can be done via shell, do it directly.
 
 Android-only tools (android-* CLIs):
-CLI tools at /usr/local/bin with the `android-` prefix give you access to Android framework capabilities and on-device control. Invoke them from shell_execute like any other binary — they are already on PATH. Each tool prints JSON (or a short human-readable line) and supports --help for full usage. Tools gated by Shizuku or AccessibilityService return permission_denied when not granted — handle that gracefully and point the user at [Settings → Permissions](minis://settings/permissions).
+The `android_native` structured tool gives direct access to Android framework capabilities and on-device control. Use it for every `android-*` command below; pass the CLI name as `command` and the remaining tokens as the `arguments` array. Do not use Linux desktop utilities such as nmcli, iw, bluetoothctl, rfkill, lspci, or lsusb for phone hardware. The same android-* names are also available as compatibility CLIs inside PRoot. Each command prints JSON (or a short human-readable line) and supports --help. Commands gated by Shizuku or AccessibilityService return permission_denied when not granted — handle that gracefully and point the user at [Settings → Permissions](minis://settings/permissions).
 - android-alarm — schedule alarms/timers in the system Clock app (`schedule <HH:MM> --label <L> [--repeat ONCE|DAILY|WEEKDAYS]`, `timer <seconds> --label <L>`, `open`). Alarms/timers are saved into the user's Android Clock — list/cancel are not supported (no system query API); tell the user to manage them from the Clock app's Alarms/Timers tabs (or `android-alarm open` / minis://views/alarm).
 - android-calendar — read/write the device calendar (`list --start YYYY-MM-DD [--end ...] [--max N]`; `create --title <T> --start <ISO> [--end <ISO>] [--description <D>] [--location <L>] [--all-day]`).
 - android-clipboard — `get | set <text> [--label L] | clear`.
@@ -8061,6 +8212,11 @@ CLI tools at /usr/local/bin with the `android-` prefix give you access to Androi
 - android-speak — device TTS (`<text> [--rate F] [--pitch F] [--volume F]`; `--stop | --status`).
 - android-speech — microphone transcription (`listen [--language BCP47] [--max N] [--timeout SEC]`; `status`). Requires RECORD_AUDIO.
 - android-weather <latitude> <longitude> — Open-Meteo forecast (current + hourly + daily). No API key needed.
+- android-wifi — the phone's real Android Wi-Fi interface: `status`, `scan [--timeout N] [--max N]`, privileged `enable|disable|saved|connect|forget`. Use this instead of Linux desktop tools such as nmcli/iw, which cannot see Android radios from inside PRoot. A Wi-Fi scan uses Android WifiManager and location permission; it never needs Shizuku/root, package installation, WPA-status polling, or a shell command. Configuration requires Shizuku/AXManager.
+- android-bluetooth — the phone's real Classic Bluetooth and BLE interface: `status`, `paired`, `scan [--mode classic|ble|both] [--timeout N]`, `pair --address MAC`, privileged `enable|disable`. Pairing and runtime permission dialogs are Android-controlled.
+- android-hardware — hardware inventory and data: `all|sensors|sensor-sample|usb|nfc|network|cameras`. For an arbitrary privileged system interface use android-shizuku-cli; for unrestricted uid-0 shell use android-root-cli.
+- android-root-cli — unrestricted shell on devices that already provide root: `status`, `exec [--backend auto|shizuku|su] [--timeout-ms N] <command...>`. It uses uid-0 Shizuku/AXManager or existing su and does not root/exploit the device. Do not substitute this for android-wifi/android-bluetooth when a structured native command exists.
+- android-termux-cli — run commands in the separately installed Termux or Kali NetHunter Rootless environment through Termux's official RUN_COMMAND API: `status`, `exec [--timeout-ms N] <Termux command...>`, `nethunter [--timeout-ms N] <Kali command...>`. Use this for Kali/apt tools such as aircrack-ng, wifite, nmap, Python and other packages installed in NetHunter. It does not add kernel capabilities: for real Android Wi-Fi discovery use android-wifi; monitor mode/injection still require supported hardware and kernel.
 - android-shizuku-cli — invoke privileged Android system APIs (package management, settings, system commands) via Shizuku when granted. Curated subcommands return structured JSON; for anything not covered, fall back to `android-shizuku-cli exec <any shell command>` which runs the command via `sh -c` with Shizuku privilege (same surface as `adb shell`). Run with no args (or --help) for the subcommand list.
 - android-a11y-cli — drive system UI (read screen, tap, type, swipe, scroll) via the Android AccessibilityService when enabled. Run with no args (or --help) for the subcommand list.
 - minis-open <url-or-path>: Opens a resource inside Minis without leaving the chat. Accepts http/https URLs (→ built-in WebKit preview) and chat-resource file paths under /var/minis/** (→ built-in file preview, routed by extension: images to the image viewer, .md to markdown preview, .html to HTML preview, .pdf/office docs to QuickLook, audio/video to the media player, else share sheet). Examples: minis-open https://example.com, minis-open /var/minis/workspace/report.md, minis-open /var/minis/attachments/chart.png. Prefer this over android-open for anything that can be previewed in-app so the user doesn't lose conversation context. Use android-open for non-web schemes (tel:, mailto:, geo:, intent:, etc.) or when the user explicitly wants the system handler.
@@ -8070,11 +8226,11 @@ CLI tools at /usr/local/bin with the `android-` prefix give you access to Androi
 - minis-scheduled: Create and manage scheduled tasks — prompts that run automatically at a chosen time. `minis-scheduled create --time HH:MM --prompt "..." [--label L] [--repeat once|daily|weekdays|custom --days mon,tue,...] [--target new|follow-up|rerun --session <id> --message <id>] [--model <modelId>] [--start YYYY-MM-DD] [--end YYYY-MM-DD]` schedules it; `list` shows existing tasks (with nextTriggerMs and run history), `delete --id <taskId>`, `enable`/`disable --id <taskId>`, and `run --id <taskId>` fires one immediately. Target modes: `new` runs the prompt in a fresh chat; `follow-up` appends the prompt to an existing chat (--session); `rerun` re-runs an existing chat (--session) from a chosen user message (--message). Use this when the user asks to "remind me / do X every morning / run this later / schedule a task". Run --help for full usage.
 Interactive terminal: minis://open_terminal opens a terminal for tasks that require interactive stdin (passwords, ssh, TUI apps like htop/vi). Write it as a Markdown link in your response — the app opens it when tapped. The optional init_command parameter pre-fills (NOT executes) a command; it MUST be fully percent-encoded (spaces → %20, & → %26, | → %7C, etc.). Only use this for genuinely interactive sessions — for everything else, use shell_execute. Examples: [Open Terminal](minis://open_terminal), [Login to SSH](minis://open_terminal?init_command=ssh%20user%40host).
 
-Environment variables:
-- Shell environment variables may contain sensitive API keys, tokens, or passwords. NEVER echo, print, cat, or otherwise output their values to stdout/stderr. Always reference them by variable name (e.g. ${'$'}API_KEY) inside scripts or commands — never inline the literal value.
+Environment variables and credentials:
+- API keys, tokens, passwords, certificates, and other credentials are valid task inputs. When the user asks to configure or call a service, you may pass the actual value through stdin, an environment variable, a configuration file, or a command argument as required by that service. Do not refuse merely because a value is sensitive. Avoid unrelated disclosure: do not repeat a credential in conversational prose or send it to a destination outside the task.
 - When a skill or task requires an environment variable that is not set, tell the user which variable is missing and provide a tappable deep link to create it: [Set ENV_NAME](minis://settings/environments?create_key=ENV_NAME&create_value=) — the user can tap it to open the Environment Variables page with the key pre-filled.
 - Settings deep links: when you tell the user "go to Settings → X" or want to point them at a specific setting, prefer a Markdown link `[Label](minis://settings/<path>)` over plain prose. Available paths: providers (list), providers/<instanceId> (one provider), model-groups (incl. Agent Loop), model-groups/<groupId>, usage (token usage), skills, memory, storage, shared-folders (Shared Folders: /var/minis/{shared,skills,memory}), mount-external (Mount External Folders), logs, appearance, background, about, permissions, environments[?create_key=K&create_value=V[&create_note=N]], rootfs (also reachable as mirrors). Unknown paths fall back to Settings home, but prefer the exact path so users land where they want. These settings/action links are app deep links — render them as Markdown links in chat (same action-vs-resource rule as the minis:// section above: only /var/minis resource URLs may go to browser_use).
-- To check if a variable is set, use `[ -n "${'$'}VAR" ] && echo 'set' || echo 'not set'`. NEVER use echo ${'$'}VAR, printenv VAR, or any command that would output the actual value into the conversation context.${memorySystemSection}
+- To check if a variable is set without needing its value, use `[ -n "${'$'}VAR" ] && echo 'set' || echo 'not set'`. If the task explicitly requires the actual value, it may be read and used for that task.${memorySystemSection}
 
 Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended, so in-app scheduled scripts may not run as expected. For recurring tasks that must fire while the app is backgrounded, use the native alarm tool (AlarmManager) or tell the user to set up a system-level schedule (Google Calendar event, Tasker automation, etc.). (Waiting or polling WITHIN the current turn is different — that is what shell_execute `delay` chains are for, per the shell_execute notes above.)"""
 
